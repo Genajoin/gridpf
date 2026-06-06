@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (pre-commit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Runs every hook from .pre-commit-config.yaml (ruff, ruff-format,
+      # whitespace/eof/yaml/toml checks). The commit-msg-stage commitizen
+      # hook is skipped automatically in --all-files mode.
+      - uses: pre-commit/action@v3.0.1
+
+  typecheck:
+    name: Type check (mypy)
+    runs-on: ubuntu-latest
+    # Required gate: mypy must be clean before merge (see branch protection).
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # setuptools_scm needs full history + tags for the version
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[dev]"
+      - run: mypy gridpf
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # setuptools_scm needs full history + tags for the version
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[test]"
+      - run: pytest tests/ --cov=gridpf --cov-report=xml --cov-report=term
+      - uses: actions/upload-artifact@v4
+        if: matrix.python-version == '3.11'
+        with:
+          name: coverage-xml
+          path: coverage.xml
+
+  build:
+    name: Build (sdist + wheel)
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck, test]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install build
+      - run: python -m build
+      - run: pipx run twine check dist/*
+      # Release readiness: the distributable wheel must install into a clean
+      # environment and actually solve a real case — not merely pass metadata
+      # checks. Run from /tmp so `import gridpf` resolves to the INSTALLED
+      # wheel, not the source tree in the workspace.
+      - name: Smoke-test built wheel in a clean environment
+        run: |
+          python -m venv /tmp/smoke-env
+          /tmp/smoke-env/bin/pip install --upgrade pip
+          /tmp/smoke-env/bin/pip install "$(ls dist/*.whl)"
+          cd /tmp
+          /tmp/smoke-env/bin/python - <<'PY'
+          import numpy as np
+          import gridpf
+          from gridpf import PFInput, PFOptions, solve
+
+          print("gridpf version:", gridpf.__version__)
+          # Минимальная 2-узловая сеть: slack(0) — PQ(1) с нагрузкой 0.5+j0.2 p.u.
+          z = 0.02 + 0.06j
+          net = PFInput(
+              n_bus=2, n_branch=1,
+              bus_ids=np.array([10, 11], dtype=np.int64),
+              bus_vn_kv=np.array([110.0, 110.0]),
+              bus_type=np.array([2, 0], dtype=np.int8),
+              slack_idx=0,
+              branch_ids=np.array([100], dtype=np.int64),
+              from_idx=np.array([0], dtype=np.int64),
+              to_idx=np.array([1], dtype=np.int64),
+              branch_r=np.array([z.real]), branch_x=np.array([z.imag]),
+              branch_g=np.zeros(1), branch_b=np.zeros(1),
+              branch_g_from=np.zeros(1), branch_b_from=np.zeros(1),
+              branch_g_to=np.zeros(1), branch_b_to=np.zeros(1),
+              tap_ratio=np.array([1.0]), phase_shift=np.zeros(1),
+              bus_g_shunt=np.zeros(2), bus_b_shunt=np.zeros(2),
+              bus_p_injection=np.array([0.0, -0.5]),
+              bus_q_injection=np.array([0.0, -0.2]),
+          )
+          res = solve(net, PFOptions())
+          assert res.converged, "PF failed to converge on the 2-bus smoke case"
+          print(f"wheel smoke OK - converged={res.converged} "
+                f"it_nr={res.iterations_nr} |V|={np.abs(res.V).round(4).tolist()}")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*

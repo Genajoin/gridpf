@@ -1,0 +1,76 @@
+name: Release
+
+# Publish to PyPI when a version tag is pushed.
+#
+# Versioning is handled by setuptools_scm (the tag IS the version) and tags are
+# created from Conventional Commits with `cz bump` (run locally, then
+# `git push --follow-tags`). This workflow only builds and publishes.
+#
+# Publishing uses PyPI Trusted Publishing (OIDC) — no API token in secrets.
+# One-time setup on PyPI: add this repository as a trusted publisher for the
+# `gridpf` project, workflow `release.yml`, environment `pypi`.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install build
+      - run: python -m build
+      - run: pipx run twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # required for Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    name: GitHub Release
+    # Independent of PyPI publish: depends only on a good build, so a GitHub
+    # Release (with attached artifacts) is created even if the PyPI step is
+    # not yet wired (e.g. before the trusted publisher is configured). Re-run
+    # the publish job separately once PyPI is set up.
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # create the release + upload assets
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so --generate-notes can diff against the previous tag
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Create GitHub Release with auto-generated notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/*
