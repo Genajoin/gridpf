@@ -200,3 +200,22 @@ class PFResult:
     voltage_dependent_load_active: bool = False
     """Был ли расчёт выполнен с учётом СХН (``use_load_voltage_dependency=True`` +
     в сети присутствуют узлы с нетривиальной полиномиальной характеристикой)."""
+
+    @property
+    def branch_loss_p(self) -> np.ndarray:
+        """Активные потери по ветвям, МВт: ``Re(S_from + S_to)``.
+
+        Обе стороны — «в ветвь», поэтому сумма = рассеяние в ветви
+        (серия + ветвевые шунты). Главный инженерный критерий качества
+        режима — наряду с :attr:`branch_loss_q`.
+        """
+        return np.asarray(self.S_from.real + self.S_to.real)
+
+    @property
+    def branch_loss_q(self) -> np.ndarray:
+        """Реактивные потери по ветвям, МВАр: ``Im(S_from + S_to)``.
+
+        Отрицательные значения возможны на слабозагруженных ВЛ —
+        зарядка (ветвевые b) превышает потери в X.
+        """
+        return np.asarray(self.S_from.imag + self.S_to.imag)
