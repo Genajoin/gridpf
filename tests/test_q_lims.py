@@ -83,6 +83,56 @@ class TestEnforceQLimitsHelper:
         # locked_lim показывает закрепление.
         assert float(res.locked_lim[1]) == pytest.approx(q_max[1], rel=1e-10)
 
+    def test_constant_load_generator_semantics(self) -> None:
+        """Q-лимит — лимит ГЕНЕРАТОРА и при константной нагрузке (без СХН):
+        нетто-инъекция узла «генерация + нагрузка» глубоко ниже ``q_min``
+        генератора, но ``Q_gen = Q_calc + Q_load`` внутри лимитов → свопа нет
+        (раньше без активной СХН проверка сравнивала нетто и ложно свопала)."""
+        from dataclasses import replace
+
+        from gridpf import PFOptions, build_ybus, solve
+        from tests.conftest import _build_net
+
+        # PV-узел 1 несёт и генерацию, и Q-нагрузку 0.8 (константа: b0=1, b1=b2=0).
+        net = _build_net(
+            bus_type=[2, 1, 0],
+            edges=[(0, 1, 0.01, 0.05), (1, 2, 0.02, 0.06)],
+            p_inj=[0.0, 0.3, -0.5],
+            q_inj=[0.0, -0.3, -0.2],
+            schn={
+                "bus_p_gen": [0.0, 0.3, 0.0],
+                "bus_q_gen": [0.0, 0.5, 0.0],
+                "bus_p_load": [0.0, 0.0, 0.5],
+                "bus_q_load": [0.0, 0.8, 0.2],
+            },
+        )
+        net = replace(
+            net,
+            bus_v_set=np.array([1.0, 1.02, np.nan]),
+            bus_va_set=np.array([0.0, np.nan, np.nan]),
+        )
+        # Калибровка: фактический Q_gen PV-узла в решении без лимитов.
+        ref = solve(net, PFOptions(enforce_q_lims=False))
+        assert ref.converged
+        ybus, _, _ = build_ybus(net)
+        q_calc_1 = float((ref.V * np.conj(ybus @ ref.V))[1].imag)
+        q_gen_1 = q_calc_1 + 0.8  # константная Q-нагрузка узла
+
+        # Лимиты генератора вокруг фактического Q_gen (внутри); нетто-инъекция
+        # (Q_gen − 0.8) при этом глубоко ниже q_min — старая нетто-семантика
+        # дала бы ложный своп pv->pq_qmin.
+        net_lim = replace(
+            net,
+            bus_q_min=np.array([np.nan, q_gen_1 - 0.1, np.nan]),
+            bus_q_max=np.array([np.nan, q_gen_1 + 0.1, np.nan]),
+        )
+        res = solve(net_lim, PFOptions(enforce_q_lims=True))
+        assert res.converged
+        assert res.q_lim_swaps == 0
+        assert res.q_violations == 0
+        # PV удержал уставку — решение совпало с безлимитным.
+        np.testing.assert_allclose(res.V, ref.V, atol=1e-8)
+
     def test_qmin_violation_pv_to_pq(self) -> None:
         """Q_gen < Q_min на PV-шине → переключение в PQ, Sbus.imag = Q_min."""
         ybus, V, Sbus, pv, pq = _make_3bus()
