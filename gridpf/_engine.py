@@ -434,9 +434,22 @@ def run_powerflow(
             ):
                 q_violations += 1
 
+    # Sanity-гейт правдоподобия: NR может численно сойтись (mismatch < tol)
+    # в нижнюю ветвь PV-кривой (|V| ~ 0.1–0.3 p.u. при несогласованных
+    # инжекциях) — физически это несошедшийся режим.
+    implausible_v_nodes = 0
+    if converged and options.v_plausible_range is not None:
+        v_lo, v_hi = options.v_plausible_range
+        vm_final = np.abs(V)
+        implausible_v_nodes = int(np.count_nonzero((vm_final < v_lo) | (vm_final > v_hi)))
+        if implausible_v_nodes:
+            converged = False
+
     failure_reason = ""
     if not converged:
-        if _has_orphan_component(network_pu):
+        if implausible_v_nodes:
+            failure_reason = "implausible_voltage"
+        elif _has_orphan_component(network_pu):
             failure_reason = "no_slack_component"
         elif np.isnan(mismatch) or not np.isfinite(mismatch):
             failure_reason = "singular_jacobian"
@@ -460,5 +473,6 @@ def run_powerflow(
         q_lim_swaps=q_lim_swaps,
         q_violations=q_violations,
         failure_reason=failure_reason,
+        implausible_v_nodes=implausible_v_nodes,
         voltage_dependent_load_active=use_load_v,
     )

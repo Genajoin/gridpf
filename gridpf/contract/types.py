@@ -150,6 +150,14 @@ class PFOptions:
         dc_fallback: при расхождении NR пробовать DC-warm-start и второй NR-проход.
         use_load_voltage_dependency: учитывать СХН (полиномиальную зависимость
             нагрузки от ``|V|``).
+        v_plausible_range: ``(lo, hi)`` — диапазон физического правдоподобия
+            ``|V|`` p.u. финального решения. NR может численно сойтись
+            (mismatch < tol) в физически бессмысленную точку нижней ветви
+            PV-кривой (|V| ~ 0.1–0.3 p.u. при несогласованных инжекциях) —
+            такой режим помечается ``converged=False`` с
+            ``failure_reason="implausible_voltage"``. Диапазон намеренно
+            экстремальный (легитимные тяжёлые режимы не задевает);
+            ``None`` — проверка выключена (прежнее поведение).
     """
 
     method: Method = "gs+nr"
@@ -164,6 +172,7 @@ class PFOptions:
     q_lim_tol: float = 0.0
     dc_fallback: bool = True
     use_load_voltage_dependency: bool = True
+    v_plausible_range: tuple[float, float] | None = (0.5, 1.5)
 
 
 @dataclass
@@ -203,7 +212,10 @@ class PFResult:
     failure_reason: str = ""
     """Если ``converged=False`` — короткий код причины: ``max_iter_reached``,
     ``singular_jacobian``, ``no_slack_component``, ``voltage_collapse``,
-    ``infeasible_q_lims``. Пустая строка при успехе."""
+    ``infeasible_q_lims``, ``implausible_voltage``. Пустая строка при успехе."""
+    implausible_v_nodes: int = 0
+    """Узлов с ``|V|`` вне ``v_plausible_range`` в численно сошедшемся решении
+    (>0 ⇒ ``converged=False``, ``failure_reason="implausible_voltage"``)."""
     voltage_dependent_load_active: bool = False
     """Был ли расчёт выполнен с учётом СХН (``use_load_voltage_dependency=True`` +
     в сети присутствуют узлы с нетривиальной полиномиальной характеристикой)."""
