@@ -133,6 +133,72 @@ class TestEnforceQLimitsHelper:
         # PV удержал уставку — решение совпало с безлимитным.
         np.testing.assert_allclose(res.V, ref.V, atol=1e-8)
 
+    def test_q_lim_tol_deadband_suppresses_swap(self) -> None:
+        """Нарушение внутри deadband ``q_lim_tol`` — свопа нет; вне — есть."""
+        ybus, V, Sbus, pv, pq = _make_3bus()
+        n = 3
+        S_calc = V * np.conj(ybus @ V)
+        q_gen_1 = float(S_calc[1].imag)
+
+        q_min = np.full(n, np.nan)
+        q_max = np.full(n, np.nan)
+        q_max[1] = q_gen_1 - 0.01  # превышение ровно на 0.01 p.u.
+        v_set = np.full(n, np.nan)
+        v_set[1] = 1.02
+        locked = np.full(n, np.nan)
+
+        # tol больше превышения → нарушение гасится deadband'ом.
+        res = enforce_q_limits(
+            ybus,
+            V,
+            Sbus,
+            pv,
+            pq,
+            q_min,
+            q_max,
+            v_set,
+            locked,
+            pv_original=pv,
+            q_lim_tol=0.02,
+        )
+        assert not res.changed
+        assert res.actions == []
+
+        # tol меньше превышения → своп происходит, фиксируется сам лимит.
+        res2 = enforce_q_limits(
+            ybus,
+            V,
+            Sbus,
+            pv,
+            pq,
+            q_min,
+            q_max,
+            v_set,
+            locked,
+            pv_original=pv,
+            q_lim_tol=0.005,
+        )
+        assert res2.changed
+        assert len(res2.actions) == 1
+        assert res2.actions[0].q_value == pytest.approx(q_max[1], rel=1e-10)
+
+    def test_q_lim_tol_default_zero_strict(self) -> None:
+        """Default ``q_lim_tol=0`` — строгая проверка (поведение бит-в-бит)."""
+        ybus, V, Sbus, pv, pq = _make_3bus()
+        n = 3
+        S_calc = V * np.conj(ybus @ V)
+        q_gen_1 = float(S_calc[1].imag)
+
+        q_min = np.full(n, np.nan)
+        q_max = np.full(n, np.nan)
+        q_max[1] = q_gen_1 - 1e-6
+        v_set = np.full(n, np.nan)
+        v_set[1] = 1.02
+        locked = np.full(n, np.nan)
+
+        res = enforce_q_limits(ybus, V, Sbus, pv, pq, q_min, q_max, v_set, locked, pv_original=pv)
+        assert res.changed
+
     def test_qmin_violation_pv_to_pq(self) -> None:
         """Q_gen < Q_min на PV-шине → переключение в PQ, Sbus.imag = Q_min."""
         ybus, V, Sbus, pv, pq = _make_3bus()

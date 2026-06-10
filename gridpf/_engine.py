@@ -114,6 +114,7 @@ def run_powerflow(
     max_q_lim_swaps = options.max_q_lim_swaps
     allow_pq_to_pv = options.allow_pq_to_pv
     q_lim_top_k = options.q_lim_top_k
+    q_lim_tol = options.q_lim_tol
     dc_fallback = options.dc_fallback
     use_load_voltage_dependency = options.use_load_voltage_dependency
 
@@ -246,6 +247,7 @@ def run_powerflow(
                 pv_original=pv_original,
                 allow_pq_to_pv=allow_pq_to_pv,
                 top_k=q_lim_top_k,
+                q_lim_tol=q_lim_tol,
                 # network_pu передаётся ВСЕГДА: генераторная семантика лимитов
                 # (Q_gen = Q_calc + Q_load) не зависит от активности СХН — при
                 # неактивной СХН Q_load константна (= bus_q_load), но вычитать
@@ -421,12 +423,14 @@ def run_powerflow(
             q_load_fin = network_pu.bus_q_load * (b0 + b1 * Vm_fin + b2 * Vm_fin * Vm_fin)
         else:
             q_load_fin = np.asarray(network_pu.bus_q_load, dtype=np.float64)
+        # Та же deadband-семантика, что и в проверке свопа: нарушение внутри
+        # q_lim_tol нарушением не считается (репортинг согласован с enforcement).
         for k in pv_original.tolist():
             qk_gen = float(S_calc_final[k].imag) + float(q_load_fin[k])
             qmax_k = q_max[k] if q_max is not None else np.nan
             qmin_k = q_min[k] if q_min is not None else np.nan
-            if (not np.isnan(qmax_k) and qk_gen > qmax_k + 1e-6) or (
-                not np.isnan(qmin_k) and qk_gen < qmin_k - 1e-6
+            if (not np.isnan(qmax_k) and qk_gen > qmax_k + q_lim_tol + 1e-6) or (
+                not np.isnan(qmin_k) and qk_gen < qmin_k - q_lim_tol - 1e-6
             ):
                 q_violations += 1
 

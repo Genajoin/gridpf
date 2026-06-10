@@ -141,6 +141,12 @@ class PFOptions:
             ``False``, MATPOWER-конвенция — резко стабилизирует outer-loop).
         q_lim_top_k: за одну итерацию переключать только ``top_k`` самых тяжёлых
             нарушителей (``None`` — всех сразу).
+        q_lim_tol: deadband на нарушение Q-лимита (p.u.) при проверке PV → PQ:
+            узел свопается только если ``Q_gen`` выходит за ``[Q_min − tol,
+            Q_max + tol]``. Гасит ложные переключения узлов, чья Q сидит на
+            границе и отклоняется на малый residual (например, небаланс мягкого
+            IPM при воспроизведении SE-режима). ``0.0`` (default) — прежнее
+            поведение бит-в-бит.
         dc_fallback: при расхождении NR пробовать DC-warm-start и второй NR-проход.
         use_load_voltage_dependency: учитывать СХН (полиномиальную зависимость
             нагрузки от ``|V|``).
@@ -155,6 +161,7 @@ class PFOptions:
     max_q_lim_swaps: int = 30
     allow_pq_to_pv: bool = False
     q_lim_top_k: int | None = 3
+    q_lim_tol: float = 0.0
     dc_fallback: bool = True
     use_load_voltage_dependency: bool = True
 

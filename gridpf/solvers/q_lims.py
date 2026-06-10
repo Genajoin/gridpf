@@ -71,6 +71,7 @@ def enforce_q_limits(
     pv_original: np.ndarray,
     allow_pq_to_pv: bool = False,
     top_k: int | None = None,
+    q_lim_tol: float = 0.0,
     network_pu: PFInput | None = None,
     voltage_dependent_load: bool = True,
 ) -> QLimResult:
@@ -88,6 +89,10 @@ def enforce_q_limits(
         locked_lim: ``(n,)`` — на каком Q-лимите закреплён узел; NaN если не закреплён.
         pv_original: индексы шин, которые в исходной модели были PV
             (нужны для обратного перевода PQ → PV).
+        q_lim_tol: deadband на нарушение лимита (p.u.): своп PV → PQ только
+            при ``Q_gen > Q_max + tol`` / ``Q_gen < Q_min − tol``. ``0.0``
+            (default) — строгая проверка, прежнее поведение бит-в-бит.
+            При свопе фиксируется сам лимит (не ``лимит ± tol``).
         network_pu: при наличии (и заполненном ``bus_q_load``) включает
             ГЕНЕРАТОРНУЮ семантику: Q-лимит трактуется как лимит
             **генератора** (``Q_gen``), а не суммарной инъекции;
@@ -154,9 +159,9 @@ def enforce_q_limits(
             qk_gen = qk_calc + (float(q_load_at_v[k]) if q_load_at_v is not None else 0.0)
             qmax_k = float(q_max[k])
             qmin_k = float(q_min[k])
-            if not np.isnan(qmax_k) and qk_gen > qmax_k:
+            if not np.isnan(qmax_k) and qk_gen > qmax_k + q_lim_tol:
                 violators.append((qk_gen - qmax_k, k, qmax_k, "qmax"))
-            elif not np.isnan(qmin_k) and qk_gen < qmin_k:
+            elif not np.isnan(qmin_k) and qk_gen < qmin_k - q_lim_tol:
                 violators.append((qmin_k - qk_gen, k, qmin_k, "qmin"))
 
         if top_k is not None and top_k > 0 and len(violators) > top_k:
