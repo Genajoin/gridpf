@@ -11,8 +11,7 @@ authoritative version (`setuptools_scm`).
 
 ### Added
 
-- Initial public release: pure-Python Power Flow engine (`gridpf`) extracted from
-  the eris-pf adapter.
+- Initial pure-Python Power Flow engine (`gridpf`):
   - Opaque per-unit data contract `PFInput` / `PFOptions` / `PFResult`
     (`gridpf.contract`), versioned (`CONTRACT_VERSION`) with `.npz` serialization.
   - Model-free `solve(net, options, *, init_v=None)`: Gauss-Seidel warm-start +
