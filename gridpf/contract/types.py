@@ -141,9 +141,23 @@ class PFOptions:
             ``False``, MATPOWER-конвенция — резко стабилизирует outer-loop).
         q_lim_top_k: за одну итерацию переключать только ``top_k`` самых тяжёлых
             нарушителей (``None`` — всех сразу).
+        q_lim_tol: deadband на нарушение Q-лимита (p.u.) при проверке PV → PQ:
+            узел свопается только если ``Q_gen`` выходит за ``[Q_min − tol,
+            Q_max + tol]``. Гасит ложные переключения узлов, чья Q сидит на
+            границе и отклоняется на малый residual (например, небаланс мягкого
+            IPM при воспроизведении SE-режима). ``0.0`` (default) — прежнее
+            поведение бит-в-бит.
         dc_fallback: при расхождении NR пробовать DC-warm-start и второй NR-проход.
         use_load_voltage_dependency: учитывать СХН (полиномиальную зависимость
             нагрузки от ``|V|``).
+        v_plausible_range: ``(lo, hi)`` — диапазон физического правдоподобия
+            ``|V|`` p.u. финального решения. NR может численно сойтись
+            (mismatch < tol) в физически бессмысленную точку нижней ветви
+            PV-кривой (|V| ~ 0.1–0.3 p.u. при несогласованных инжекциях) —
+            такой режим помечается ``converged=False`` с
+            ``failure_reason="implausible_voltage"``. Диапазон намеренно
+            экстремальный (легитимные тяжёлые режимы не задевает);
+            ``None`` — проверка выключена (прежнее поведение).
     """
 
     method: Method = "gs+nr"
@@ -155,8 +169,10 @@ class PFOptions:
     max_q_lim_swaps: int = 30
     allow_pq_to_pv: bool = False
     q_lim_top_k: int | None = 3
+    q_lim_tol: float = 0.0
     dc_fallback: bool = True
     use_load_voltage_dependency: bool = True
+    v_plausible_range: tuple[float, float] | None = (0.5, 1.5)
 
 
 @dataclass
@@ -196,7 +212,10 @@ class PFResult:
     failure_reason: str = ""
     """Если ``converged=False`` — короткий код причины: ``max_iter_reached``,
     ``singular_jacobian``, ``no_slack_component``, ``voltage_collapse``,
-    ``infeasible_q_lims``. Пустая строка при успехе."""
+    ``infeasible_q_lims``, ``implausible_voltage``. Пустая строка при успехе."""
+    implausible_v_nodes: int = 0
+    """Узлов с ``|V|`` вне ``v_plausible_range`` в численно сошедшемся решении
+    (>0 ⇒ ``converged=False``, ``failure_reason="implausible_voltage"``)."""
     voltage_dependent_load_active: bool = False
     """Был ли расчёт выполнен с учётом СХН (``use_load_voltage_dependency=True`` +
     в сети присутствуют узлы с нетривиальной полиномиальной характеристикой)."""

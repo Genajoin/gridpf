@@ -114,6 +114,7 @@ def run_powerflow(
     max_q_lim_swaps = options.max_q_lim_swaps
     allow_pq_to_pv = options.allow_pq_to_pv
     q_lim_top_k = options.q_lim_top_k
+    q_lim_tol = options.q_lim_tol
     dc_fallback = options.dc_fallback
     use_load_voltage_dependency = options.use_load_voltage_dependency
 
@@ -246,7 +247,13 @@ def run_powerflow(
                 pv_original=pv_original,
                 allow_pq_to_pv=allow_pq_to_pv,
                 top_k=q_lim_top_k,
-                network_pu=network_pu if use_load_v else None,
+                q_lim_tol=q_lim_tol,
+                # network_pu передаётся ВСЕГДА: генераторная семантика лимитов
+                # (Q_gen = Q_calc + Q_load) не зависит от активности СХН — при
+                # неактивной СХН Q_load константна (= bus_q_load), но вычитать
+                # её обязательно (см. enforce_q_limits).
+                network_pu=network_pu,
+                voltage_dependent_load=use_load_v,
             )
             if not qlim_res.changed:
                 outer_done = True
@@ -397,14 +404,17 @@ def run_powerflow(
         s_to = np.empty(0, dtype=np.complex128)
 
     # Подсчёт PV-узлов с нарушением Q-лимитов в финальном решении.
-    # При активной СХН Q-лимит сравнивается с Q_gen = Q_inj + Q_load(|V|),
-    # а не с сетевой Q_inj — иначе мы ложно репортуем нарушение из-за
-    # переменной нагрузки на узле.
+    # Q-лимит сравнивается с Q_gen = Q_inj + Q_load (генераторная семантика,
+    # как в enforce_q_limits), а не с сетевой Q_inj — иначе мы ложно репортуем
+    # нарушение из-за нагрузки на узле. При активной СХН Q_load зависит от
+    # |V| (полином), иначе — константа bus_q_load.
     q_violations = 0
     if can_enforce and converged:
         I_bus = ybus @ V
         S_calc_final = V * np.conj(I_bus)
-        if use_load_v and network_pu.bus_q_load is not None:
+        if network_pu.bus_q_load is None:
+            q_load_fin = np.zeros(network_pu.n_bus)
+        elif use_load_v:
             Vm_fin = np.abs(V)
             b0 = network_pu.bus_q_b0
             b1 = network_pu.bus_q_b1
@@ -412,19 +422,34 @@ def run_powerflow(
             assert b0 is not None and b1 is not None and b2 is not None
             q_load_fin = network_pu.bus_q_load * (b0 + b1 * Vm_fin + b2 * Vm_fin * Vm_fin)
         else:
-            q_load_fin = np.zeros(network_pu.n_bus)
+            q_load_fin = np.asarray(network_pu.bus_q_load, dtype=np.float64)
+        # Та же deadband-семантика, что и в проверке свопа: нарушение внутри
+        # q_lim_tol нарушением не считается (репортинг согласован с enforcement).
         for k in pv_original.tolist():
             qk_gen = float(S_calc_final[k].imag) + float(q_load_fin[k])
             qmax_k = q_max[k] if q_max is not None else np.nan
             qmin_k = q_min[k] if q_min is not None else np.nan
-            if (not np.isnan(qmax_k) and qk_gen > qmax_k + 1e-6) or (
-                not np.isnan(qmin_k) and qk_gen < qmin_k - 1e-6
+            if (not np.isnan(qmax_k) and qk_gen > qmax_k + q_lim_tol + 1e-6) or (
+                not np.isnan(qmin_k) and qk_gen < qmin_k - q_lim_tol - 1e-6
             ):
                 q_violations += 1
 
+    # Sanity-гейт правдоподобия: NR может численно сойтись (mismatch < tol)
+    # в нижнюю ветвь PV-кривой (|V| ~ 0.1–0.3 p.u. при несогласованных
+    # инжекциях) — физически это несошедшийся режим.
+    implausible_v_nodes = 0
+    if converged and options.v_plausible_range is not None:
+        v_lo, v_hi = options.v_plausible_range
+        vm_final = np.abs(V)
+        implausible_v_nodes = int(np.count_nonzero((vm_final < v_lo) | (vm_final > v_hi)))
+        if implausible_v_nodes:
+            converged = False
+
     failure_reason = ""
     if not converged:
-        if _has_orphan_component(network_pu):
+        if implausible_v_nodes:
+            failure_reason = "implausible_voltage"
+        elif _has_orphan_component(network_pu):
             failure_reason = "no_slack_component"
         elif np.isnan(mismatch) or not np.isfinite(mismatch):
             failure_reason = "singular_jacobian"
@@ -448,5 +473,6 @@ def run_powerflow(
         q_lim_swaps=q_lim_swaps,
         q_violations=q_violations,
         failure_reason=failure_reason,
+        implausible_v_nodes=implausible_v_nodes,
         voltage_dependent_load_active=use_load_v,
     )

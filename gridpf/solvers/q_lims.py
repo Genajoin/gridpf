@@ -71,7 +71,9 @@ def enforce_q_limits(
     pv_original: np.ndarray,
     allow_pq_to_pv: bool = False,
     top_k: int | None = None,
+    q_lim_tol: float = 0.0,
     network_pu: PFInput | None = None,
+    voltage_dependent_load: bool = True,
 ) -> QLimResult:
     """Применить Q-лимиты после очередного NR-прогона.
 
@@ -87,13 +89,27 @@ def enforce_q_limits(
         locked_lim: ``(n,)`` — на каком Q-лимите закреплён узел; NaN если не закреплён.
         pv_original: индексы шин, которые в исходной модели были PV
             (нужны для обратного перевода PQ → PV).
-        network_pu: при наличии включает корректное взаимодействие с СХН.
-            Q-лимит трактуется как лимит **генератора** (``Q_gen``), а не
-            суммарной инъекции; ``Q_load(|V|)`` вычитается из ``Q_calc``.
+        q_lim_tol: deadband на нарушение лимита (p.u.): своп PV → PQ только
+            при ``Q_gen > Q_max + tol`` / ``Q_gen < Q_min − tol``. ``0.0``
+            (default) — строгая проверка, прежнее поведение бит-в-бит.
+            При свопе фиксируется сам лимит (не ``лимит ± tol``).
+        network_pu: при наличии (и заполненном ``bus_q_load``) включает
+            ГЕНЕРАТОРНУЮ семантику: Q-лимит трактуется как лимит
+            **генератора** (``Q_gen``), а не суммарной инъекции;
+            ``Q_load(|V|)`` вычитается из ``Q_calc``. Семантика НЕ зависит
+            от нетривиальности СХН — при тривиальных/отсутствующих
+            коэффициентах нагрузка константна (``Q_load = bus_q_load``),
+            но вычитать её для сравнения с лимитом генератора всё равно
+            обязательно (иначе узел «генерация + нагрузка» сравнивает
+            НЕТТО-инъекцию с лимитами генератора — ложные свопы).
             При swap'е PV→PQ возвращается обновлённый ``bus_q_gen_new``,
-            который вызывающий код подаёт в ``compute_sbus`` для пересчёта
-            ``Sbus`` с учётом переменной нагрузки. Без СХН swap пишет
-            ``Q_inj`` напрямую в ``Sbus`` (legacy-поведение).
+            который вызывающий код при активной СХН подаёт в
+            ``compute_sbus`` для пересчёта ``Sbus``. Без ``network_pu``
+            swap пишет ``Q_inj`` напрямую в ``Sbus`` (legacy-поведение,
+            Q-лимит = лимит нетто-инъекции).
+        voltage_dependent_load: активна ли СХН в текущем расчёте. ``True`` —
+            ``Q_load(|V|)`` по полиному; ``False`` — нагрузка константна
+            (``Q_load = bus_q_load``, как в ``build_sbus``).
 
     Returns:
         :class:`QLimResult` с обновлёнными ``pv``/``pq``/``Sbus``,
@@ -106,16 +122,23 @@ def enforce_q_limits(
     locked_new = locked_lim.copy()
     actions: list[QLimAction] = []
 
-    # При активной СХН Q-лимит относится к генератору, поэтому из Q_calc
-    # (сетевая Q-инъекция) вычитаем текущую Q_load(|V|), чтобы получить Q_gen.
-    use_load = network_pu is not None and network_pu.has_voltage_dependent_load
+    # Q-лимит относится к ГЕНЕРАТОРУ, поэтому из Q_calc (сетевая Q-инъекция)
+    # вычитаем текущую Q_load, чтобы получить Q_gen. С активной СХН нагрузка
+    # зависит от |V| (полином); без неё — константа bus_q_load (тот же смысл).
+    # Гейт только на наличие данных, НЕ на нетривиальность СХН: раньше сеть
+    # с константными нагрузками сравнивала нетто-инъекцию с лимитами
+    # генератора и массово ложно свопала узлы «генерация + нагрузка».
+    use_load = network_pu is not None and network_pu.bus_q_load is not None
     if use_load:
         assert network_pu is not None
-        Vm_now = np.abs(V)
-        b0, b1, b2 = network_pu.bus_q_b0, network_pu.bus_q_b1, network_pu.bus_q_b2
         q_load_arr = network_pu.bus_q_load
-        assert b0 is not None and b1 is not None and b2 is not None and q_load_arr is not None
-        q_load_at_v = q_load_arr * (b0 + b1 * Vm_now + b2 * Vm_now * Vm_now)
+        assert q_load_arr is not None
+        b0, b1, b2 = network_pu.bus_q_b0, network_pu.bus_q_b1, network_pu.bus_q_b2
+        if voltage_dependent_load and b0 is not None and b1 is not None and b2 is not None:
+            Vm_now = np.abs(V)
+            q_load_at_v = q_load_arr * (b0 + b1 * Vm_now + b2 * Vm_now * Vm_now)
+        else:
+            q_load_at_v = np.asarray(q_load_arr, dtype=np.float64)
         bus_q_gen_new: np.ndarray | None = (
             network_pu.bus_q_gen.copy() if network_pu.bus_q_gen is not None else None
         )
@@ -136,9 +159,9 @@ def enforce_q_limits(
             qk_gen = qk_calc + (float(q_load_at_v[k]) if q_load_at_v is not None else 0.0)
             qmax_k = float(q_max[k])
             qmin_k = float(q_min[k])
-            if not np.isnan(qmax_k) and qk_gen > qmax_k:
+            if not np.isnan(qmax_k) and qk_gen > qmax_k + q_lim_tol:
                 violators.append((qk_gen - qmax_k, k, qmax_k, "qmax"))
-            elif not np.isnan(qmin_k) and qk_gen < qmin_k:
+            elif not np.isnan(qmin_k) and qk_gen < qmin_k - q_lim_tol:
                 violators.append((qmin_k - qk_gen, k, qmin_k, "qmin"))
 
         if top_k is not None and top_k > 0 and len(violators) > top_k:
