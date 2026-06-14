@@ -89,10 +89,10 @@ def dc_powerflow(
     B_red = B[pvpq, :][:, pvpq]
     P_red = P_inj[pvpq]
 
-    try:
-        delta_red = spsolve(B_red, P_red)
-    except RuntimeError:
-        # Сингулярная B' — вернуть нулевые углы (худший случай — flat-старт).
+    delta_red = spsolve(B_red, P_red)
+    if not np.all(np.isfinite(delta_red)):
+        # Сингулярная B' (scipy.spsolve даёт NaN-вектор, не исключение) —
+        # вернуть нулевые углы (худший случай — flat-старт).
         return np.zeros(n_bus, dtype=np.float64)
 
     delta = np.zeros(n_bus, dtype=np.float64)

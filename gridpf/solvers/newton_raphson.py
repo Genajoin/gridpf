@@ -159,7 +159,7 @@ def newton_raphson(
 
     iteration = 0
     converged = False
-    for iteration in range(1, max_iter + 1):
+    for iteration in range(1, max_iter + 1):  # noqa: B007 — счётчик нужен в return
         if use_load:
             assert network_pu is not None
             dP_load, dQ_load = load_voltage_derivatives(network_pu, V)
@@ -167,13 +167,15 @@ def newton_raphson(
         else:
             dS_load_dVm = None
         J = build_jacobian(Ybus, V, pv, pq, dS_load_dVm=dS_load_dVm)
-        try:
-            dx = spsolve(J, -f_vec)
-        except RuntimeError as exc:
-            raise RuntimeError(
-                f"Якобиан сингулярен на итерации {iteration}: {exc}. "
-                "Проверьте связность сети и адекватность инъекций."
-            ) from exc
+        dx = spsolve(J, -f_vec)
+        if not np.all(np.isfinite(dx)):
+            # Сингулярный якобиан: scipy.spsolve на нём возвращает NaN-вектор
+            # (с MatrixRankWarning), а НЕ исключение. Прерываем с последним
+            # КОНЕЧНЫМ V; mismatch=nan → _engine классифицирует
+            # singular_jacobian и активирует DC-fallback из живой точки
+            # (вместо ~30 пустых итераций по NaN).
+            norm_f = float("nan")
+            break
 
         # Полный шаг μ=1 пробуем всегда; backtracking активен только если
         # норма выросла И step_control=True.
@@ -182,6 +184,7 @@ def newton_raphson(
         )
         if step_control and norm_try > norm_f:
             mu = 0.5
+            descent = False
             for _bt in range(5):
                 Vm_bt, Va_bt, V_bt, f_bt, norm_bt = _try_step(
                     Ybus, Vm, Va, dx, mu, pv, pq, Sbus, network_pu, use_load
@@ -189,8 +192,15 @@ def newton_raphson(
                 if norm_bt < norm_try:
                     Vm_try, Va_try, V_try, f_try, norm_try = (Vm_bt, Va_bt, V_bt, f_bt, norm_bt)
                 if norm_bt < norm_f:
+                    descent = True
                     break
                 mu *= 0.5
+            if not descent:
+                # Бэктрекинг не нашёл спуска ниже norm_f → НЕ коммитим uphill-шаг.
+                # Выходим из NR с последним ХОРОШИМ (Vm,Va,V,f_vec,norm_f) —
+                # детерминированный неуспех из лучшей точки, здоровее DC-fallback.
+                converged = False
+                break
 
         Vm, Va, V, f_vec, norm_f = Vm_try, Va_try, V_try, f_try, norm_try
 

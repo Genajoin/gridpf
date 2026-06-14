@@ -104,17 +104,27 @@ def gauss_seidel(
     # CSR подходит для row slicing, но Ybus[k, k] лучше извлечь заранее.
     diag_y = np.asarray(Ybus.diagonal())
 
+    # Прямой доступ к CSR-массивам: per-узловой row·V через indptr-срез +
+    # np.dot (BLAS) вместо Ybus.getrow(k) (строит 1-строчный CSR на каждый
+    # узел/итерацию — главный хотспот GS). sort_indices идемпотентен.
+    Ybus.sort_indices()
+    y_data, y_idx, y_indptr = Ybus.data, Ybus.indices, Ybus.indptr
+
     iteration = 0
     converged = False
     for iteration in range(1, max_iter + 1):  # noqa: B007 — счётчик нужен в return
         # Обновление PQ-шин. На каждой PQ-шине, если активна СХН, пересчитываем
         # инъекцию через текущий |V_k|; иначе используем константу.
+        # СХН диагональна (Sbus[k]=f(|V[k]|)), а V[k] читается ДО своей мутации
+        # внизу итерации → пересчёт всех PQ-инъекций один раз перед циклом
+        # тождествен пер-узловому (бит-в-бит), но без 1 вызова compute_sbus на узел.
+        if use_load:
+            assert network_pu is not None
+            sv_pre = compute_sbus(network_pu, V, voltage_dependent=True)
+            Sbus_local[pq] = sv_pre[pq]
         for k in pq:
-            if use_load:
-                assert network_pu is not None
-                Sbus_local[k] = compute_sbus(network_pu, V, voltage_dependent=True)[k]
-            row_k = Ybus.getrow(k)
-            row_dot_v = complex((row_k @ V).item())
+            s_k, e_k = y_indptr[k], y_indptr[k + 1]
+            row_dot_v = complex(np.dot(y_data[s_k:e_k], V[y_idx[s_k:e_k]]))
             tmp = (np.conj(Sbus_local[k] / V[k]) - row_dot_v) / diag_y[k]
             V[k] = V[k] + tmp
 
@@ -124,8 +134,8 @@ def gauss_seidel(
         # перед итерацией; здесь нагрузка у PV редка, оставляем как есть.
         if pv.size:
             for k in pv:
-                row_k = Ybus.getrow(k)
-                row_dot_v = complex((row_k @ V).item())
+                s_k, e_k = y_indptr[k], y_indptr[k + 1]
+                row_dot_v = complex(np.dot(y_data[s_k:e_k], V[y_idx[s_k:e_k]]))
                 q_calc = (V[k] * np.conj(row_dot_v)).imag
                 Sbus_local[k] = Sbus_local[k].real + 1j * q_calc
                 tmp = (np.conj(Sbus_local[k] / V[k]) - row_dot_v) / diag_y[k]

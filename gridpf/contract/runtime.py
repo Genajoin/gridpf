@@ -39,7 +39,10 @@ def solve(
         gridpf.contract.validate.PFContractValidationError: при
             ``validate=True`` и структурно несогласованном входе.
         ValueError: если метод неизвестен или в сети нет slack-узла.
-        RuntimeError: если якобиан Newton сингулярен.
+
+    Note:
+        Сингулярный якобиан Newton НЕ бросает исключение — расчёт завершается
+        ``PFResult(converged=False, failure_reason="singular_jacobian")``.
     """
     if options is None:
         options = PFOptions()

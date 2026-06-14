@@ -101,7 +101,11 @@ def run_powerflow(
 
     Raises:
         ValueError: если метод неизвестен или в сети нет slack-узла.
-        RuntimeError: если якобиан Newton сингулярен.
+
+    Note:
+        Сингулярный якобиан Newton НЕ бросает исключение: scipy на вырожденной
+        матрице возвращает NaN-вектор, итерация прерывается с последним конечным
+        ``V`` → ``PFResult(converged=False, failure_reason="singular_jacobian")``.
     """
     method = options.method
     if method not in ("gs+nr", "nr", "gs"):

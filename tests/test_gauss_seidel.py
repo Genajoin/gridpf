@@ -139,3 +139,30 @@ class TestGaussSeidelPV:
         res = gauss_seidel(ybus, sbus, v0, ref, pv, pq, tol=1e-8, max_iter=500)
         assert res.converged
         np.testing.assert_allclose(abs(res.V[1]), 1.02, atol=1e-8)
+
+
+def test_gs_indptr_dot_matches_getrow() -> None:
+    """Страж S3: per-узловой ``np.dot(y_data[s:e], V[idx[s:e]])`` (indptr-срез,
+    используется в GS) численно эквивалентен ``Ybus.getrow(k) @ V``.
+
+    np.dot (BLAS pairwise) и scipy csr_matvec суммируют в разном порядке —
+    расхождение ~1e-16/строку допустимо, но будущий рефактор GS не должен
+    тихо вырастить дрейф. Привязываем rtol=1e-12.
+    """
+    from scipy.sparse import csr_matrix
+
+    rng = np.random.default_rng(0)
+    n = 80
+    dense = rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))
+    dense[np.abs(dense) < 1.0] = 0.0  # разрядить
+    np.fill_diagonal(dense, dense.diagonal() + 5.0)  # доминирующая диагональ
+    ybus = csr_matrix(dense)
+    ybus.sort_indices()
+    v = rng.standard_normal(n) + 1j * rng.standard_normal(n)
+
+    y_data, y_idx, y_indptr = ybus.data, ybus.indices, ybus.indptr
+    for k in range(n):
+        s, e = y_indptr[k], y_indptr[k + 1]
+        slice_dot = complex(np.dot(y_data[s:e], v[y_idx[s:e]]))
+        getrow_dot = complex((ybus.getrow(k) @ v).item())
+        np.testing.assert_allclose(slice_dot, getrow_dot, rtol=1e-12, atol=1e-12)
