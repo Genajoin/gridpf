@@ -14,7 +14,9 @@ soft-fallback к классификации без переключений. Set
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from dataclasses import replace as _dc_replace
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -23,14 +25,22 @@ from gridpf.algebra.ybus import build_ybus
 from gridpf.contract.types import BASE_MVA, PFInput, PFOptions, PFResult
 from gridpf.solvers.dc_pf import dc_powerflow
 from gridpf.solvers.gauss_seidel import gauss_seidel
-from gridpf.solvers.newton_raphson import newton_raphson
+from gridpf.solvers.newton_raphson import NRResult, newton_raphson
 from gridpf.solvers.q_lims import enforce_q_limits, q_limit_violations
+
+
+if TYPE_CHECKING:
+    from scipy.sparse import csr_matrix
 
 
 # Extra slack on top of q_lim_tol when *reporting* violations: buses that
 # enforcement pinned exactly at their limit must not be counted as violators
 # because of the final NR residual.
 _Q_VIOLATION_EPS = 1e-6
+
+# Final mismatch above this norm reads as a diverged (collapsing) voltage
+# solution rather than a mere max-iterations stall.
+_VOLTAGE_COLLAPSE_MISMATCH = 1e3
 
 
 def _has_orphan_component(network_pu: PFInput) -> bool:
@@ -86,6 +96,336 @@ def _apply_setpoints(network_pu: PFInput, V0: np.ndarray) -> np.ndarray:
     return result
 
 
+@dataclass
+class _NRState:
+    """Voltage / iteration / convergence accumulator across solver passes.
+
+    Every NR pass in the engine folds its outcome in through :meth:`absorb`,
+    so the "run solver, unpack four fields" boilerplate lives in one place.
+    """
+
+    V: np.ndarray
+    iters_nr: int = 0
+    mismatch: float = field(default=float("nan"))
+    converged: bool = False
+
+    def absorb(self, res: NRResult) -> None:
+        """Fold one solver pass into the accumulated state."""
+        self.V = res.V
+        self.iters_nr += res.iterations
+        self.mismatch = res.mismatch_max
+        self.converged = res.converged
+
+
+@dataclass
+class _Classification:
+    """Bus classification plus the state the Q-limit loop swaps alongside it.
+
+    A PV→PQ swap changes ``pv``/``pq``/``sbus``/``locked_lim`` and (with
+    voltage-dependent load) ``net.bus_q_gen`` together; bundling them makes
+    snapshot/rollback a single-object operation instead of five parallel
+    variables.
+    """
+
+    pv: np.ndarray
+    pq: np.ndarray
+    sbus: np.ndarray
+    locked_lim: np.ndarray
+    net: PFInput
+
+    def restore(self, snap: _Classification) -> None:
+        """Roll back to a previously taken snapshot."""
+        self.pv = snap.pv
+        self.pq = snap.pq
+        self.sbus = snap.sbus
+        self.locked_lim = snap.locked_lim
+        self.net = snap.net
+
+
+def _run_nr(
+    state: _NRState,
+    cls: _Classification,
+    ybus: csr_matrix,
+    ref: np.ndarray,
+    *,
+    options: PFOptions,
+    use_load: bool,
+) -> None:
+    """One Newton-Raphson pass from ``state.V`` under the current classification."""
+    state.absorb(
+        newton_raphson(
+            ybus,
+            cls.sbus,
+            state.V,
+            ref,
+            cls.pv,
+            cls.pq,
+            tol=options.tol,
+            max_iter=options.max_iter_nr,
+            network_pu=cls.net,
+            voltage_dependent_load=use_load,
+        )
+    )
+
+
+def _nr_with_q_limits(
+    state: _NRState,
+    cls: _Classification,
+    ybus: csr_matrix,
+    ref: np.ndarray,
+    *,
+    options: PFOptions,
+    use_load: bool,
+    can_enforce: bool,
+    pv_original: np.ndarray,
+    v_set_arr: np.ndarray,
+) -> tuple[int, PFInput]:
+    """Newton-Raphson plus the outer PV→PQ enforcement loop.
+
+    Mutates ``state`` and ``cls`` in place. Without ``can_enforce`` this is
+    exactly one NR pass. Returns ``(q_lim_swaps, pre_swap_net)`` where
+    ``pre_swap_net`` is the network snapshot taken before the last committed
+    swap — the soft fallback uses it to restore ``bus_q_gen``.
+    """
+    q_min = cls.net.bus_q_min
+    q_max = cls.net.bus_q_max
+    snap = _dc_replace(cls)
+    outer_done = False
+    q_lim_swaps = 0
+
+    for _swap_iter in range(options.max_q_lim_swaps + 1):
+        _run_nr(state, cls, ybus, ref, options=options, use_load=use_load)
+
+        if not can_enforce:
+            break
+        if not state.converged:
+            # NR не сошёлся при текущей классификации. Откатываем последнее
+            # переключение и пробуем добить решение без него — типично
+            # «overshoot» при массовом swap'е делает следующий NR
+            # неустойчивым.
+            cls.restore(snap)
+            _run_nr(state, cls, ybus, ref, options=options, use_load=use_load)
+            break
+
+        assert q_min is not None and q_max is not None  # защищено can_enforce
+        qlim_res = enforce_q_limits(
+            ybus,
+            state.V,
+            cls.sbus,
+            cls.pv,
+            cls.pq,
+            q_min,
+            q_max,
+            v_set_arr,
+            cls.locked_lim,
+            pv_original=pv_original,
+            allow_pq_to_pv=options.allow_pq_to_pv,
+            top_k=options.q_lim_top_k,
+            q_lim_tol=options.q_lim_tol,
+            # network_pu передаётся ВСЕГДА: генераторная семантика лимитов
+            # (Q_gen = Q_calc + Q_load) не зависит от активности СХН — при
+            # неактивной СХН Q_load константна (= bus_q_load), но вычитать
+            # её обязательно (см. enforce_q_limits).
+            network_pu=cls.net,
+            voltage_dependent_load=use_load,
+        )
+        if not qlim_res.changed:
+            outer_done = True
+            break
+
+        # Сохраняем «предыдущее хорошее» состояние перед коммитом swap'а
+        snap = _dc_replace(cls)
+        cls.pv = qlim_res.pv
+        cls.pq = qlim_res.pq
+        cls.locked_lim = qlim_res.locked_lim
+        # При активной СХН: фиксируем bus_q_gen на лимите, далее sbus
+        # пересчитывается compute_sbus каждую NR-итерацию. Без СХН —
+        # legacy: Sbus.imag = Q_lim напрямую.
+        if use_load and qlim_res.bus_q_gen_new is not None:
+            cls.net = _dc_replace(cls.net, bus_q_gen=qlim_res.bus_q_gen_new)
+            cls.sbus = compute_sbus(cls.net, state.V, voltage_dependent=True)
+        else:
+            cls.sbus = qlim_res.Sbus
+        q_lim_swaps += len(qlim_res.actions)
+        state.converged = False  # требуется ещё один прогон NR с новой классификацией
+
+    # Если outer-loop достиг лимита (а не отработал break по changed=False),
+    # делаем финальный NR с уже коммитнутой классификацией — даёт шанс
+    # «дотянуть» сходимость на тех моделях, где enforcement-цикл сошёлся
+    # фактически, но формально не успел подтвердиться.
+    if can_enforce and not outer_done and not state.converged:
+        _run_nr(state, cls, ybus, ref, options=options, use_load=use_load)
+
+    return q_lim_swaps, snap.net
+
+
+def _soft_fallback(
+    state: _NRState,
+    cls: _Classification,
+    ybus: csr_matrix,
+    *,
+    options: PFOptions,
+    use_load: bool,
+    pre_swap_net: PFInput,
+) -> None:
+    """Retry with the *original* classification when enforcement failed.
+
+    Guarantees ``enforce_q_lims=True`` is never worse than the baseline run;
+    remaining violations are reported via ``PFResult.q_violations``. Mutates
+    ``state``/``cls`` only when the fallback NR converges (a failed fallback
+    leaves the previous best state, iteration counts included, untouched).
+    """
+    # Восстанавливаем исходную классификацию узлов и оригинальный
+    # bus_q_gen (без swap-фиксаций); СХН остаётся включённой.
+    net_orig = (
+        _dc_replace(cls.net, bus_q_gen=pre_swap_net.bus_q_gen)
+        if pre_swap_net is not cls.net
+        else cls.net
+    )
+    ref_orig, pv_orig_arr, pq_orig_arr = classify_buses(net_orig.bus_type)
+    sbus_orig = (
+        compute_sbus(net_orig, _flat_start(net_orig), voltage_dependent=True)
+        if use_load
+        else build_sbus(net_orig)
+    )
+    # Для устойчивости — повторный flat + GS warm-start.
+    V_fb = _apply_setpoints(net_orig, _flat_start(net_orig))
+    if options.method in ("gs", "gs+nr"):
+        gs_fb = gauss_seidel(
+            ybus,
+            sbus_orig,
+            V_fb,
+            ref_orig,
+            pv_orig_arr,
+            pq_orig_arr,
+            tol=options.gs_tol,
+            max_iter=options.max_iter_gs,
+            network_pu=net_orig,
+            voltage_dependent_load=use_load,
+        )
+        V_fb = gs_fb.V
+    nr_fb = newton_raphson(
+        ybus,
+        sbus_orig,
+        V_fb,
+        ref_orig,
+        pv_orig_arr,
+        pq_orig_arr,
+        tol=options.tol,
+        max_iter=options.max_iter_nr,
+        network_pu=net_orig,
+        voltage_dependent_load=use_load,
+    )
+    if nr_fb.converged:
+        state.absorb(nr_fb)
+        cls.net = net_orig
+        cls.pv = pv_orig_arr
+
+
+def _dc_fallback(
+    state: _NRState,
+    cls: _Classification,
+    ybus: csr_matrix,
+    *,
+    options: PFOptions,
+    use_load: bool,
+) -> None:
+    """DC warm-start retry: linearized angles, then one more NR pass.
+
+    Mutates ``state``/``cls`` only when the retry converges.
+    """
+    ref_d, pv_d, pq_d = classify_buses(cls.net.bus_type)
+    sbus_d = build_sbus(cls.net)
+    delta_dc = dc_powerflow(
+        n_bus=cls.net.n_bus,
+        from_idx=cls.net.from_idx,
+        to_idx=cls.net.to_idx,
+        branch_x=cls.net.branch_x,
+        tap_ratio=cls.net.tap_ratio,
+        P_inj=sbus_d.real,
+        ref=ref_d,
+        pv=pv_d,
+        pq=pq_d,
+    )
+    # Стартовое V для NR: модули как в flat+setpoints, углы из DC.
+    V_dc = _apply_setpoints(cls.net, _flat_start(cls.net))
+    V_dc = np.abs(V_dc) * np.exp(1j * delta_dc)
+    nr_dc = newton_raphson(
+        ybus,
+        sbus_d,
+        V_dc,
+        ref_d,
+        pv_d,
+        pq_d,
+        tol=options.tol,
+        max_iter=options.max_iter_nr,
+        network_pu=cls.net,
+        voltage_dependent_load=use_load,
+    )
+    if nr_dc.converged:
+        state.absorb(nr_dc)
+        cls.pv = pv_d
+
+
+def _branch_flows(
+    net: PFInput, V: np.ndarray, yf: csr_matrix, yt: csr_matrix
+) -> tuple[np.ndarray, np.ndarray]:
+    """Branch power flows in MVA (``S_base × p.u.``) for both branch ends."""
+    if net.n_branch == 0:
+        empty = np.empty(0, dtype=np.complex128)
+        return empty, empty
+    s_from = V[net.from_idx] * np.conj(yf @ V) * BASE_MVA
+    s_to = V[net.to_idx] * np.conj(yt @ V) * BASE_MVA
+    return s_from, s_to
+
+
+def _count_q_violations(
+    net: PFInput,
+    V: np.ndarray,
+    ybus: csr_matrix,
+    pv_original: np.ndarray,
+    *,
+    q_lim_tol: float,
+    use_load: bool,
+) -> int:
+    """Count originally-PV buses violating generator Q-limits at the solution.
+
+    Generator semantics, shared with :func:`enforce_q_limits`: the limit is
+    compared against ``Q_gen = Q_inj + Q_load(|V|)``, not the net injection —
+    otherwise a loaded generator bus reports a false violation. The deadband
+    is widened by :data:`_Q_VIOLATION_EPS` so reporting stays consistent with
+    what enforcement pinned at the limit.
+    """
+    q_min, q_max = net.bus_q_min, net.bus_q_max
+    assert q_min is not None and q_max is not None  # guarded by can_enforce
+    S_calc = V * np.conj(ybus @ V)
+    q_gen = S_calc.imag + q_load_at(net, V, voltage_dependent=use_load)
+    return len(
+        q_limit_violations(q_gen, q_min, q_max, pv_original, tol=q_lim_tol + _Q_VIOLATION_EPS)
+    )
+
+
+def _classify_failure(
+    net: PFInput,
+    mismatch: float,
+    *,
+    implausible_v_nodes: int,
+    q_violations_reported: bool,
+) -> str:
+    """Map a non-converged final state to a short ``failure_reason`` code."""
+    if implausible_v_nodes:
+        return "implausible_voltage"
+    if _has_orphan_component(net):
+        return "no_slack_component"
+    if not np.isfinite(mismatch):
+        return "singular_jacobian"
+    if mismatch > _VOLTAGE_COLLAPSE_MISMATCH:
+        return "voltage_collapse"
+    if q_violations_reported:
+        return "infeasible_q_lims"
+    return "max_iter_reached"
+
+
 def run_powerflow(
     net: PFInput,
     options: PFOptions,
@@ -116,59 +456,47 @@ def run_powerflow(
     method = options.method
     if method not in ("gs+nr", "nr", "gs"):
         raise ValueError(f"Неизвестный method={method!r}; ожидался 'gs+nr', 'nr' или 'gs'.")
-    tol = options.tol
-    max_iter_gs = options.max_iter_gs
-    max_iter_nr = options.max_iter_nr
-    gs_tol = options.gs_tol
-    enforce_q_lims = options.enforce_q_lims
-    max_q_lim_swaps = options.max_q_lim_swaps
-    allow_pq_to_pv = options.allow_pq_to_pv
-    q_lim_top_k = options.q_lim_top_k
-    q_lim_tol = options.q_lim_tol
-    dc_fallback = options.dc_fallback
-    use_load_voltage_dependency = options.use_load_voltage_dependency
 
-    network_pu = net
-    ybus, yf, yt = build_ybus(network_pu)
-    sbus = build_sbus(network_pu)
-    ref, pv, pq = classify_buses(network_pu.bus_type)
+    ybus, yf, yt = build_ybus(net)
+    sbus = build_sbus(net)
+    ref, pv, pq = classify_buses(net.bus_type)
 
     # Стартовое приближение: тёплый старт init_v (выровнен адаптером по
-    # network_pu.bus_ids) либо flat. None → flat (бит-в-бит).
-    V0 = init_v if init_v is not None else _flat_start(network_pu)
+    # net.bus_ids) либо flat. None → flat (бит-в-бит).
     # Setpoints PV/slack клампятся ПОВЕРХ старта (Rule №4): заданный модуль/угол
     # всегда побеждает тёплый старт на управляемых узлах.
-    V0 = _apply_setpoints(network_pu, V0)
+    V0 = init_v if init_v is not None else _flat_start(net)
+    V0 = _apply_setpoints(net, V0)
 
     # Начальные параметры enforce_q_lims (если выключено — массивы не используются).
     pv_original = pv.copy()
-    v_set_arr = np.full(network_pu.n_bus, np.nan, dtype=np.float64)
+    v_set_arr = np.full(net.n_bus, np.nan, dtype=np.float64)
     v_set_arr[pv] = np.abs(V0[pv])
-    locked_lim = np.full(network_pu.n_bus, np.nan, dtype=np.float64)
-    q_min = network_pu.bus_q_min
-    q_max = network_pu.bus_q_max
-    can_enforce = enforce_q_lims and q_min is not None and q_max is not None
-
-    iters_gs = 0
-    iters_nr = 0
-    q_lim_swaps = 0
-    V = V0
-    converged = False
-    mismatch = float("nan")
+    can_enforce = options.enforce_q_lims and net.bus_q_min is not None and net.bus_q_max is not None
 
     # СХН активна, если: пользователь не отключил, в сети есть нетривиальные
     # коэффициенты и доступны базовые поля. Совместима с enforce_q_lims:
     # внешний цикл swap'ов фиксирует bus_q_gen на Q-лимите, дальнейшие NR
-    # пересчитывают Sbus через compute_sbus(network_pu, V).
-    use_load_v = use_load_voltage_dependency and network_pu.has_voltage_dependent_load
+    # пересчитывают Sbus через compute_sbus(net, V).
+    use_load_v = options.use_load_voltage_dependency and net.has_voltage_dependent_load
     # Перестраиваем Sbus с учётом СХН на flat-старте — чтобы GS не стартовал
     # с устаревшей константой.
     if use_load_v:
-        sbus = compute_sbus(network_pu, V0, voltage_dependent=True)
+        sbus = compute_sbus(net, V0, voltage_dependent=True)
+
+    state = _NRState(V=V0)
+    cls = _Classification(
+        pv=pv,
+        pq=pq,
+        sbus=sbus,
+        locked_lim=np.full(net.n_bus, np.nan, dtype=np.float64),
+        net=net,
+    )
+    iters_gs = 0
+    q_lim_swaps = 0
 
     # GS warm-start выполняется один раз — переключения PV/PQ затрагивают только NR-фазу.
     if method in ("gs", "gs+nr"):
-        gs_local_tol = tol if method == "gs" else gs_tol
         gs_res = gauss_seidel(
             ybus,
             sbus,
@@ -176,297 +504,90 @@ def run_powerflow(
             ref,
             pv,
             pq,
-            tol=gs_local_tol,
-            max_iter=max_iter_gs,
-            network_pu=network_pu,
+            tol=options.tol if method == "gs" else options.gs_tol,
+            max_iter=options.max_iter_gs,
+            network_pu=net,
             voltage_dependent_load=use_load_v,
         )
-        V = gs_res.V
+        state.V = gs_res.V
         iters_gs = gs_res.iterations
-        mismatch = gs_res.mismatch_max
+        state.mismatch = gs_res.mismatch_max
         if method == "gs":
-            converged = gs_res.converged
+            state.converged = gs_res.converged
 
     # Внешний цикл по Q-лимитам. Без enforce_q_lims — ровно одна итерация NR.
     if method in ("nr", "gs+nr"):
-        last_swap_pv = pv.copy()
-        last_swap_pq = pq.copy()
-        last_swap_sbus = sbus.copy()
-        last_swap_locked = locked_lim.copy()
-        last_swap_net = network_pu  # для отката bus_q_gen
-        outer_done = False
-        for _swap_iter in range(max_q_lim_swaps + 1):
-            nr_res = newton_raphson(
-                ybus,
-                sbus,
-                V,
-                ref,
-                pv,
-                pq,
-                tol=tol,
-                max_iter=max_iter_nr,
-                network_pu=network_pu,
-                voltage_dependent_load=use_load_v,
-            )
-            V = nr_res.V
-            iters_nr += nr_res.iterations
-            mismatch = nr_res.mismatch_max
-            converged = nr_res.converged
-
-            if not can_enforce:
-                break
-            if not converged:
-                # NR не сошёлся при текущей классификации. Откатываем последнее
-                # переключение и пробуем добить решение без него — типично
-                # «overshoot» при массовом swap'е делает следующий NR
-                # неустойчивым.
-                pv = last_swap_pv
-                pq = last_swap_pq
-                sbus = last_swap_sbus
-                locked_lim = last_swap_locked
-                network_pu = last_swap_net
-                nr_res = newton_raphson(
-                    ybus,
-                    sbus,
-                    V,
-                    ref,
-                    pv,
-                    pq,
-                    tol=tol,
-                    max_iter=max_iter_nr,
-                    network_pu=network_pu,
-                    voltage_dependent_load=use_load_v,
-                )
-                V = nr_res.V
-                iters_nr += nr_res.iterations
-                mismatch = nr_res.mismatch_max
-                converged = nr_res.converged
-                break
-
-            assert q_min is not None and q_max is not None  # защищено can_enforce
-            qlim_res = enforce_q_limits(
-                ybus,
-                V,
-                sbus,
-                pv,
-                pq,
-                q_min,
-                q_max,
-                v_set_arr,
-                locked_lim,
-                pv_original=pv_original,
-                allow_pq_to_pv=allow_pq_to_pv,
-                top_k=q_lim_top_k,
-                q_lim_tol=q_lim_tol,
-                # network_pu передаётся ВСЕГДА: генераторная семантика лимитов
-                # (Q_gen = Q_calc + Q_load) не зависит от активности СХН — при
-                # неактивной СХН Q_load константна (= bus_q_load), но вычитать
-                # её обязательно (см. enforce_q_limits).
-                network_pu=network_pu,
-                voltage_dependent_load=use_load_v,
-            )
-            if not qlim_res.changed:
-                outer_done = True
-                break
-            # Сохраняем «предыдущее хорошее» состояние перед коммитом swap'а
-            last_swap_pv = pv
-            last_swap_pq = pq
-            last_swap_sbus = sbus
-            last_swap_locked = locked_lim
-            last_swap_net = network_pu
-            pv = qlim_res.pv
-            pq = qlim_res.pq
-            locked_lim = qlim_res.locked_lim
-            # При активной СХН: фиксируем bus_q_gen на лимите, далее sbus
-            # пересчитывается compute_sbus каждую NR-итерацию. Без СХН —
-            # legacy: Sbus.imag = Q_lim напрямую.
-            if use_load_v and qlim_res.bus_q_gen_new is not None:
-                network_pu = _dc_replace(network_pu, bus_q_gen=qlim_res.bus_q_gen_new)
-                sbus = compute_sbus(network_pu, V, voltage_dependent=True)
-            else:
-                sbus = qlim_res.Sbus
-            q_lim_swaps += len(qlim_res.actions)
-            converged = False  # требуется ещё один прогон NR с новой классификацией
-
-        # Если outer-loop достиг лимита (а не отработал break по changed=False),
-        # делаем финальный NR с уже коммитнутой классификацией — даёт шанс
-        # «дотянуть» сходимость на тех моделях, где enforcement-цикл сошёлся
-        # фактически, но формально не успел подтвердиться.
-        if can_enforce and not outer_done and not converged:
-            nr_res = newton_raphson(
-                ybus,
-                sbus,
-                V,
-                ref,
-                pv,
-                pq,
-                tol=tol,
-                max_iter=max_iter_nr,
-                network_pu=network_pu,
-                voltage_dependent_load=use_load_v,
-            )
-            V = nr_res.V
-            iters_nr += nr_res.iterations
-            mismatch = nr_res.mismatch_max
-            converged = nr_res.converged
-
+        q_lim_swaps, pre_swap_net = _nr_with_q_limits(
+            state,
+            cls,
+            ybus,
+            ref,
+            options=options,
+            use_load=use_load_v,
+            can_enforce=can_enforce,
+            pv_original=pv_original,
+            v_set_arr=v_set_arr,
+        )
         # Soft-fallback: если ничего не помогло, отказываемся от enforcement
-        # и возвращаемся к классификации **без переключений**. Гарантирует,
-        # что enforce_q_lims=True никогда не хуже baseline; нарушения
-        # репортуются через PFResult.q_violations.
-        if can_enforce and not converged:
-            # Восстанавливаем исходную классификацию узлов и оригинальный
-            # bus_q_gen (без swap-фиксаций); СХН остаётся включённой.
-            net_orig = (
-                _dc_replace(network_pu, bus_q_gen=last_swap_net.bus_q_gen)
-                if last_swap_net is not network_pu
-                else network_pu
-            )
-            ref_orig, pv_orig_arr, pq_orig_arr = classify_buses(net_orig.bus_type)
-            sbus_orig = (
-                compute_sbus(net_orig, _flat_start(net_orig), voltage_dependent=True)
-                if use_load_v
-                else build_sbus(net_orig)
-            )
-            # Для устойчивости — повторный flat + GS warm-start.
-            V_fb = _flat_start(net_orig)
-            V_fb = _apply_setpoints(net_orig, V_fb)
-            if method in ("gs", "gs+nr"):
-                gs_fb = gauss_seidel(
-                    ybus,
-                    sbus_orig,
-                    V_fb,
-                    ref_orig,
-                    pv_orig_arr,
-                    pq_orig_arr,
-                    tol=gs_tol,
-                    max_iter=max_iter_gs,
-                    network_pu=net_orig,
-                    voltage_dependent_load=use_load_v,
-                )
-                V_fb = gs_fb.V
-            nr_fb = newton_raphson(
+        # и возвращаемся к классификации **без переключений**.
+        if can_enforce and not state.converged:
+            _soft_fallback(
+                state,
+                cls,
                 ybus,
-                sbus_orig,
-                V_fb,
-                ref_orig,
-                pv_orig_arr,
-                pq_orig_arr,
-                tol=tol,
-                max_iter=max_iter_nr,
-                network_pu=net_orig,
-                voltage_dependent_load=use_load_v,
+                options=options,
+                use_load=use_load_v,
+                pre_swap_net=pre_swap_net,
             )
-            if nr_fb.converged:
-                V = nr_fb.V
-                iters_nr += nr_fb.iterations
-                mismatch = nr_fb.mismatch_max
-                converged = True
-                network_pu = net_orig
-                pv = pv_orig_arr  # для подсчёта q_violations
 
     # DC warm-start fallback: если NR-расчёт (с/без enforcement) разошёлся,
     # пробуем линеаризованное DC-приближение для углов и стартуем NR ещё раз.
-    if dc_fallback and not converged and method in ("nr", "gs+nr"):
-        ref_d, pv_d, pq_d = classify_buses(network_pu.bus_type)
-        sbus_d = build_sbus(network_pu)
-        delta_dc = dc_powerflow(
-            n_bus=network_pu.n_bus,
-            from_idx=network_pu.from_idx,
-            to_idx=network_pu.to_idx,
-            branch_x=network_pu.branch_x,
-            tap_ratio=network_pu.tap_ratio,
-            P_inj=sbus_d.real,
-            ref=ref_d,
-            pv=pv_d,
-            pq=pq_d,
-        )
-        # Стартовое V для NR: модули как в flat+setpoints, углы из DC.
-        V_dc = _flat_start(network_pu)
-        V_dc = _apply_setpoints(network_pu, V_dc)
-        Vm_dc = np.abs(V_dc)
-        V_dc = Vm_dc * np.exp(1j * delta_dc)
-        nr_dc = newton_raphson(
-            ybus,
-            sbus_d,
-            V_dc,
-            ref_d,
-            pv_d,
-            pq_d,
-            tol=tol,
-            max_iter=max_iter_nr,
-            network_pu=network_pu,
-            voltage_dependent_load=use_load_v,
-        )
-        if nr_dc.converged:
-            V = nr_dc.V
-            iters_nr += nr_dc.iterations
-            mismatch = nr_dc.mismatch_max
-            converged = True
-            pv = pv_d
+    if options.dc_fallback and not state.converged and method in ("nr", "gs+nr"):
+        _dc_fallback(state, cls, ybus, options=options, use_load=use_load_v)
 
-    # Потоки ветвей в МВА (S_base × p.u.)
-    if network_pu.n_branch > 0:
-        s_from = V[network_pu.from_idx] * np.conj(yf @ V) * BASE_MVA
-        s_to = V[network_pu.to_idx] * np.conj(yt @ V) * BASE_MVA
-    else:
-        s_from = np.empty(0, dtype=np.complex128)
-        s_to = np.empty(0, dtype=np.complex128)
+    V = state.V
+    s_from, s_to = _branch_flows(cls.net, V, yf, yt)
 
-    # Подсчёт PV-узлов с нарушением Q-лимитов в финальном решении.
-    # Q-лимит сравнивается с Q_gen = Q_inj + Q_load (генераторная семантика,
-    # как в enforce_q_limits), а не с сетевой Q_inj — иначе мы ложно репортуем
-    # нарушение из-за нагрузки на узле. При активной СХН Q_load зависит от
-    # |V| (полином), иначе — константа bus_q_load.
     q_violations = 0
-    if can_enforce and converged:
-        assert q_min is not None and q_max is not None  # guarded by can_enforce
-        S_calc_final = V * np.conj(ybus @ V)
-        q_load_fin = q_load_at(network_pu, V, voltage_dependent=use_load_v)
-        # Same deadband semantics as the swap check (shared predicate), widened
-        # by _Q_VIOLATION_EPS so reporting stays consistent with enforcement.
-        q_gen_fin = S_calc_final.imag + q_load_fin
-        q_violations = len(
-            q_limit_violations(
-                q_gen_fin, q_min, q_max, pv_original, tol=q_lim_tol + _Q_VIOLATION_EPS
-            )
+    if can_enforce and state.converged:
+        q_violations = _count_q_violations(
+            cls.net,
+            V,
+            ybus,
+            pv_original,
+            q_lim_tol=options.q_lim_tol,
+            use_load=use_load_v,
         )
 
     # Sanity-гейт правдоподобия: NR может численно сойтись (mismatch < tol)
     # в нижнюю ветвь PV-кривой (|V| ~ 0.1–0.3 p.u. при несогласованных
     # инжекциях) — физически это несошедшийся режим.
     implausible_v_nodes = 0
-    if converged and options.v_plausible_range is not None:
+    if state.converged and options.v_plausible_range is not None:
         v_lo, v_hi = options.v_plausible_range
         vm_final = np.abs(V)
         implausible_v_nodes = int(np.count_nonzero((vm_final < v_lo) | (vm_final > v_hi)))
         if implausible_v_nodes:
-            converged = False
+            state.converged = False
 
     failure_reason = ""
-    if not converged:
-        if implausible_v_nodes:
-            failure_reason = "implausible_voltage"
-        elif _has_orphan_component(network_pu):
-            failure_reason = "no_slack_component"
-        elif np.isnan(mismatch) or not np.isfinite(mismatch):
-            failure_reason = "singular_jacobian"
-        elif mismatch > 1e3:
-            failure_reason = "voltage_collapse"
-        elif can_enforce and q_violations > 0:
-            failure_reason = "infeasible_q_lims"
-        else:
-            failure_reason = "max_iter_reached"
+    if not state.converged:
+        failure_reason = _classify_failure(
+            cls.net,
+            state.mismatch,
+            implausible_v_nodes=implausible_v_nodes,
+            q_violations_reported=can_enforce and q_violations > 0,
+        )
 
     return PFResult(
-        converged=converged,
+        converged=state.converged,
         iterations_gs=iters_gs,
-        iterations_nr=iters_nr,
+        iterations_nr=state.iters_nr,
         V=V,
-        bus_ids=network_pu.bus_ids,
+        bus_ids=cls.net.bus_ids,
         S_from=s_from,
         S_to=s_to,
-        mismatch_max=mismatch,
+        mismatch_max=state.mismatch,
         method=method,
         q_lim_swaps=q_lim_swaps,
         q_violations=q_violations,
