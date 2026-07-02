@@ -45,8 +45,6 @@ def residual_norm(f: np.ndarray) -> float:
     return float(np.linalg.norm(f, np.inf)) if f.size else 0.0
 
 
-def resolve_use_load(network_pu: PFInput | None, voltage_dependent_load: bool) -> bool:
+def resolve_use_load(net: PFInput | None, voltage_dependent_load: bool) -> bool:
     """Return whether voltage-dependent load handling is active for this run."""
-    return (
-        voltage_dependent_load and network_pu is not None and network_pu.has_voltage_dependent_load
-    )
+    return voltage_dependent_load and net is not None and net.has_voltage_dependent_load

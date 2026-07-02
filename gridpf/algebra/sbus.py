@@ -42,7 +42,7 @@ def _poly_eval(
 
 
 def q_load_at(
-    network_pu: PFInput,
+    net: PFInput,
     V: np.ndarray,
     *,
     voltage_dependent: bool = True,
@@ -57,32 +57,32 @@ def q_load_at(
       the constant ``bus_q_load``;
     * otherwise → the polynomial model evaluated at ``|V|``.
     """
-    q_load = network_pu.bus_q_load
+    q_load = net.bus_q_load
     if q_load is None:
-        return np.zeros(network_pu.n_bus, dtype=np.float64)
-    b0, b1, b2 = network_pu.bus_q_b0, network_pu.bus_q_b1, network_pu.bus_q_b2
+        return np.zeros(net.n_bus, dtype=np.float64)
+    b0, b1, b2 = net.bus_q_b0, net.bus_q_b1, net.bus_q_b2
     if not voltage_dependent or b0 is None or b1 is None or b2 is None:
         return np.asarray(q_load, dtype=np.float64)
     return _poly_eval(np.asarray(q_load, dtype=np.float64), b0, b1, b2, np.abs(V))
 
 
-def build_sbus(network_pu: PFInput) -> np.ndarray:
+def build_sbus(net: PFInput) -> np.ndarray:
     """Собрать комплексный вектор инъекций ``Sbus`` (p.u.).
 
     Не учитывает СХН (нагрузка трактуется как константа). Эквивалент
-    ``compute_sbus(network_pu, V=1.0, voltage_dependent=False)``.
+    ``compute_sbus(net, V=1.0, voltage_dependent=False)``.
 
     Args:
-        network_pu: p.u.-представление сети.
+        net: p.u.-представление сети.
 
     Returns:
         ``Sbus`` длиной ``n_bus``, dtype=complex128.
     """
-    return (network_pu.bus_p_injection + 1j * network_pu.bus_q_injection).astype(np.complex128)
+    return (net.bus_p_injection + 1j * net.bus_q_injection).astype(np.complex128)
 
 
 def compute_sbus(
-    network_pu: PFInput,
+    net: PFInput,
     V: np.ndarray,
     *,
     voltage_dependent: bool = True,
@@ -96,37 +96,37 @@ def compute_sbus(
 
         S_{inj}(V) = (P_{gen} - P_{load}(|V|)) + j(Q_{gen} - Q_{load}(|V|))
 
-    При ``voltage_dependent=False`` или отсутствии полей СХН в ``network_pu``
+    При ``voltage_dependent=False`` или отсутствии полей СХН в ``net``
     функция возвращает результат, эквивалентный :func:`build_sbus`.
 
     Args:
-        network_pu: p.u.-представление сети.
+        net: p.u.-представление сети.
         V: ``(n_bus,)`` complex — текущее напряжение.
         voltage_dependent: если ``False`` — игнорировать СХН и вернуть константу.
 
     Returns:
         ``Sbus`` длиной ``n_bus``, dtype=complex128.
     """
-    if not voltage_dependent or not network_pu.has_voltage_dependent_load:
-        return build_sbus(network_pu)
+    if not voltage_dependent or not net.has_voltage_dependent_load:
+        return build_sbus(net)
 
     Vm = np.abs(V)
-    p_load = network_pu.bus_p_load
-    q_load = network_pu.bus_q_load
+    p_load = net.bus_p_load
+    q_load = net.bus_q_load
     if p_load is None or q_load is None:
-        return build_sbus(network_pu)
+        return build_sbus(net)
 
     # Полиномиальная СХН: f(|V|) = c0 + c1·|V| + c2·|V|²
-    a0, a1, a2 = network_pu.bus_p_a0, network_pu.bus_p_a1, network_pu.bus_p_a2
-    b0, b1, b2 = network_pu.bus_q_b0, network_pu.bus_q_b1, network_pu.bus_q_b2
+    a0, a1, a2 = net.bus_p_a0, net.bus_p_a1, net.bus_p_a2
+    b0, b1, b2 = net.bus_q_b0, net.bus_q_b1, net.bus_q_b2
     assert a0 is not None and a1 is not None and a2 is not None
     assert b0 is not None and b1 is not None and b2 is not None
 
     p_load_v = _poly_eval(p_load, a0, a1, a2, Vm)
     q_load_v = _poly_eval(q_load, b0, b1, b2, Vm)
 
-    p_gen = network_pu.bus_p_gen
-    q_gen = network_pu.bus_q_gen
+    p_gen = net.bus_p_gen
+    q_gen = net.bus_q_gen
     assert p_gen is not None and q_gen is not None
 
     result: np.ndarray = ((p_gen - p_load_v) + 1j * (q_gen - q_load_v)).astype(np.complex128)
@@ -134,7 +134,7 @@ def compute_sbus(
 
 
 def load_voltage_derivatives(
-    network_pu: PFInput,
+    net: PFInput,
     V: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Производные нагрузки по модулю напряжения для якобиана.
@@ -148,15 +148,15 @@ def load_voltage_derivatives(
         ``(dP_load_dVm, dQ_load_dVm)`` — массивы длины ``n_bus`` (p.u./p.u.).
         Нули, если СХН отсутствует в сети.
     """
-    n = network_pu.n_bus
-    if not network_pu.has_voltage_dependent_load:
+    n = net.n_bus
+    if not net.has_voltage_dependent_load:
         return np.zeros(n, dtype=np.float64), np.zeros(n, dtype=np.float64)
 
     Vm = np.abs(V)
-    p_load = network_pu.bus_p_load
-    q_load = network_pu.bus_q_load
-    a1, a2 = network_pu.bus_p_a1, network_pu.bus_p_a2
-    b1, b2 = network_pu.bus_q_b1, network_pu.bus_q_b2
+    p_load = net.bus_p_load
+    q_load = net.bus_q_load
+    a1, a2 = net.bus_p_a1, net.bus_p_a2
+    b1, b2 = net.bus_q_b1, net.bus_q_b2
 
     # d/d|V| of the polynomial model is itself a polynomial with shifted
     # coefficients: load·(c1 + 2·c2·|V|) == _poly_eval(load, c1, 2·c2, 0, |V|).

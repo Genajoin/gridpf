@@ -49,7 +49,7 @@ def gauss_seidel(
     *,
     tol: float = 1e-2,
     max_iter: int = 10,
-    network_pu: PFInput | None = None,
+    net: PFInput | None = None,
     voltage_dependent_load: bool = False,
 ) -> GSResult:
     """Прогнать Gauss-Seidel до сходимости или ``max_iter``.
@@ -66,7 +66,7 @@ def gauss_seidel(
         pq: индексы PQ-шин.
         tol: целевая ∞-норма небаланса. Для warm-start обычно ``1e-2``…``1e-3``.
         max_iter: максимальное число итераций.
-        network_pu: p.u.-представление сети (нужно при ``voltage_dependent_load=True``).
+        net: p.u.-представление сети (нужно при ``voltage_dependent_load=True``).
         voltage_dependent_load: учитывать СХН (зависимость нагрузки от ``|V|``).
 
     Returns:
@@ -76,14 +76,14 @@ def gauss_seidel(
     if max_iter < 0:
         raise ValueError(f"max_iter должен быть ≥ 0, получено {max_iter}")
 
-    use_load = resolve_use_load(network_pu, voltage_dependent_load)
+    use_load = resolve_use_load(net, voltage_dependent_load)
 
     V = V0.astype(np.complex128, copy=True)
     Vm = np.abs(V).copy()
     Sbus_local = Sbus.astype(np.complex128, copy=True)
     if use_load:
-        assert network_pu is not None
-        Sbus_local = compute_sbus(network_pu, V, voltage_dependent=True).copy()
+        assert net is not None
+        Sbus_local = compute_sbus(net, V, voltage_dependent=True).copy()
 
     # ref здесь нужен только для исключения slack из небаланса;
     # PV ∪ PQ — узлы, по активной части которых проверяется сходимость.
@@ -114,8 +114,8 @@ def gauss_seidel(
         # внизу итерации → пересчёт всех PQ-инъекций один раз перед циклом
         # тождествен пер-узловому (бит-в-бит), но без 1 вызова compute_sbus на узел.
         if use_load:
-            assert network_pu is not None
-            sv_pre = compute_sbus(network_pu, V, voltage_dependent=True)
+            assert net is not None
+            sv_pre = compute_sbus(net, V, voltage_dependent=True)
             Sbus_local[pq] = sv_pre[pq]
         for k in pq:
             s_k, e_k = y_indptr[k], y_indptr[k + 1]
@@ -140,8 +140,8 @@ def gauss_seidel(
 
         # При активной СХН обновляем PQ-инъекции под новый |V|
         if use_load:
-            assert network_pu is not None
-            sbus_v = compute_sbus(network_pu, V, voltage_dependent=True)
+            assert net is not None
+            sbus_v = compute_sbus(net, V, voltage_dependent=True)
             Sbus_local[pq] = sbus_v[pq]
             # Real-часть на PV — тоже зависит от V (Q-часть переопределяется ниже)
             for k in pv:
