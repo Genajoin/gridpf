@@ -177,32 +177,27 @@ class PFOptions:
 
 @dataclass
 class PFResult:
-    """Результат расчёта установившегося режима.
-
-    Attributes:
-        converged: глобальный флаг сходимости (Newton, либо GS если
-            ``method="gs"``).
-        iterations_gs: число итераций GS-фазы (0 для ``method="nr"``).
-        iterations_nr: число итераций NR-фазы (0 для ``method="gs"``).
-        V: ``(n_bus,)`` complex — итоговое напряжение в p.u. (в порядке
-            ``bus_ids``).
-        bus_ids: ``(n_bus,)`` int — соответствующие непрозрачные метки строк шин.
-        S_from: ``(n_branch,)`` complex — переток ``Sf = V_f · conj(Yf · V) ·
-            S_base`` в МВА (МВт + jМВАр).
-        S_to: ``(n_branch,)`` complex — то же со стороны «до».
-        mismatch_max: ∞-норма финального небаланса (p.u.).
-        method: фактически использованный метод.
-    """
+    """Результат расчёта установившегося режима."""
 
     converged: bool
+    """глобальный флаг сходимости (Newton, либо GS если ``method="gs"``)."""
     iterations_gs: int
+    """число итераций GS-фазы (0 для ``method="nr"``)."""
     iterations_nr: int
+    """число итераций NR-фазы (0 для ``method="gs"``)."""
     V: np.ndarray
+    """``(n_bus,)`` complex — итоговое напряжение в p.u. (в порядке ``bus_ids``)."""
     bus_ids: np.ndarray
+    """``(n_bus,)`` int — соответствующие непрозрачные метки строк шин."""
     S_from: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.complex128))
+    """``(n_branch,)`` complex — переток ``Sf = V_f · conj(Yf · V) · S_base`` в
+    МВА (МВт + jМВАр)."""
     S_to: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.complex128))
+    """``(n_branch,)`` complex — то же со стороны «до»."""
     mismatch_max: float = 0.0
+    """∞-норма финального небаланса (p.u.)."""
     method: str = "gs+nr"
+    """фактически использованный метод."""
     q_lim_swaps: int = 0
     """Сколько переключений PV ↔ PQ выполнено (только при enforce_q_lims=True)."""
     q_violations: int = 0

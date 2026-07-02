@@ -68,11 +68,7 @@ class TestDCWarmStart:
         net = _three_bus_network()
         ref, pv, pq = classify_buses(net.bus_type)
         delta = dc_powerflow(
-            n_bus=net.n_bus,
-            from_idx=net.from_idx,
-            to_idx=net.to_idx,
-            branch_x=net.branch_x,
-            tap_ratio=net.tap_ratio,
+            net,
             P_inj=net.bus_p_injection,
             ref=ref,
             pv=pv,

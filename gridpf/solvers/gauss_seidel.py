@@ -17,27 +17,26 @@ Slack-шины не обновляются.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
 from scipy.sparse import csr_matrix
 
 from gridpf.algebra.sbus import compute_sbus
+from gridpf.solvers._common import (
+    SolverResult,
+    mismatch,
+    residual_norm,
+    residual_vector,
+    resolve_use_load,
+)
 
 
 if TYPE_CHECKING:
     from gridpf.contract.types import PFInput
 
 
-@dataclass
-class GSResult:
-    """Результат Gauss-Seidel итерации."""
-
-    V: np.ndarray
-    converged: bool
-    iterations: int
-    mismatch_max: float
+GSResult = SolverResult
 
 
 def gauss_seidel(
@@ -50,7 +49,7 @@ def gauss_seidel(
     *,
     tol: float = 1e-2,
     max_iter: int = 10,
-    network_pu: PFInput | None = None,
+    net: PFInput | None = None,
     voltage_dependent_load: bool = False,
 ) -> GSResult:
     """Прогнать Gauss-Seidel до сходимости или ``max_iter``.
@@ -67,7 +66,7 @@ def gauss_seidel(
         pq: индексы PQ-шин.
         tol: целевая ∞-норма небаланса. Для warm-start обычно ``1e-2``…``1e-3``.
         max_iter: максимальное число итераций.
-        network_pu: p.u.-представление сети (нужно при ``voltage_dependent_load=True``).
+        net: p.u.-представление сети (нужно при ``voltage_dependent_load=True``).
         voltage_dependent_load: учитывать СХН (зависимость нагрузки от ``|V|``).
 
     Returns:
@@ -77,25 +76,21 @@ def gauss_seidel(
     if max_iter < 0:
         raise ValueError(f"max_iter должен быть ≥ 0, получено {max_iter}")
 
-    use_load = (
-        voltage_dependent_load and network_pu is not None and network_pu.has_voltage_dependent_load
-    )
+    use_load = resolve_use_load(net, voltage_dependent_load)
 
     V = V0.astype(np.complex128, copy=True)
     Vm = np.abs(V).copy()
     Sbus_local = Sbus.astype(np.complex128, copy=True)
     if use_load:
-        assert network_pu is not None
-        Sbus_local = compute_sbus(network_pu, V, voltage_dependent=True).copy()
+        assert net is not None
+        Sbus_local = compute_sbus(net, V, voltage_dependent=True).copy()
 
     # ref здесь нужен только для исключения slack из небаланса;
     # PV ∪ PQ — узлы, по активной части которых проверяется сходимость.
-    pvpq = np.concatenate([pv, pq]).astype(np.int64)
-
     # Начальный небаланс
-    mis = V * np.conj(Ybus @ V) - Sbus_local
-    f_residual = np.concatenate([mis[pvpq].real, mis[pq].imag])
-    norm_f = float(np.linalg.norm(f_residual, np.inf)) if f_residual.size else 0.0
+    mis = mismatch(Ybus, V, Sbus_local)
+    f_residual = residual_vector(mis, pv, pq)
+    norm_f = residual_norm(f_residual)
 
     if norm_f < tol or max_iter == 0:
         return GSResult(V=V, converged=norm_f < tol, iterations=0, mismatch_max=norm_f)
@@ -119,8 +114,8 @@ def gauss_seidel(
         # внизу итерации → пересчёт всех PQ-инъекций один раз перед циклом
         # тождествен пер-узловому (бит-в-бит), но без 1 вызова compute_sbus на узел.
         if use_load:
-            assert network_pu is not None
-            sv_pre = compute_sbus(network_pu, V, voltage_dependent=True)
+            assert net is not None
+            sv_pre = compute_sbus(net, V, voltage_dependent=True)
             Sbus_local[pq] = sv_pre[pq]
         for k in pq:
             s_k, e_k = y_indptr[k], y_indptr[k + 1]
@@ -145,16 +140,16 @@ def gauss_seidel(
 
         # При активной СХН обновляем PQ-инъекции под новый |V|
         if use_load:
-            assert network_pu is not None
-            sbus_v = compute_sbus(network_pu, V, voltage_dependent=True)
+            assert net is not None
+            sbus_v = compute_sbus(net, V, voltage_dependent=True)
             Sbus_local[pq] = sbus_v[pq]
             # Real-часть на PV — тоже зависит от V (Q-часть переопределяется ниже)
             for k in pv:
                 Sbus_local[k] = sbus_v[k].real + 1j * Sbus_local[k].imag
 
-        mis = V * np.conj(Ybus @ V) - Sbus_local
-        f_residual = np.concatenate([mis[pv].real, mis[pq].real, mis[pq].imag])
-        norm_f = float(np.linalg.norm(f_residual, np.inf)) if f_residual.size else 0.0
+        mis = mismatch(Ybus, V, Sbus_local)
+        f_residual = residual_vector(mis, pv, pq)
+        norm_f = residual_norm(f_residual)
         if norm_f < tol:
             converged = True
             break
