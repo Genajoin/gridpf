@@ -37,12 +37,12 @@ if TYPE_CHECKING:
 
 
 def build_ybus(
-    network_pu: PFInput,
+    net: PFInput,
 ) -> tuple[csr_matrix, csr_matrix, csr_matrix]:
     """Построить ``(Ybus, Yf, Yt)`` в p.u.
 
     Args:
-        network_pu: p.u.-представление сети.
+        net: p.u.-представление сети.
 
     Returns:
         (Ybus, Yf, Yt) — три CSR-матрицы с complex128:
@@ -55,12 +55,12 @@ def build_ybus(
             проводимости — несоединённая ветвь должна быть исключена ещё в
             адаптере через ``status=False``).
     """
-    n_bus = network_pu.n_bus
-    n_branch = network_pu.n_branch
+    n_bus = net.n_bus
+    n_branch = net.n_branch
 
     if n_branch == 0:
         # Только узловые шунты.
-        ysh = network_pu.bus_g_shunt + 1j * network_pu.bus_b_shunt
+        ysh = net.bus_g_shunt + 1j * net.bus_b_shunt
         ybus = csr_matrix(
             (ysh.astype(np.complex128), (np.arange(n_bus), np.arange(n_bus))),
             shape=(n_bus, n_bus),
@@ -70,35 +70,27 @@ def build_ybus(
         return cast("csr_matrix", ybus), cast("csr_matrix", empty), cast("csr_matrix", empty)
 
     # ---- Параметры ветвей ----
-    z = network_pu.branch_r + 1j * network_pu.branch_x
+    z = net.branch_r + 1j * net.branch_x
     if np.any(z == 0):
-        bad = network_pu.branch_ids[z == 0].tolist()
+        bad = net.branch_ids[z == 0].tolist()
         raise ValueError(
             f"Ветви с нулевым импедансом (R=X=0) недопустимы: branch_ids={bad}. "
             "Исключите их через status=False или замените малым R/X."
         )
 
     ysf = 1.0 / z
-    yc_from = (
-        network_pu.branch_g_from
-        + 1j * network_pu.branch_b_from
-        + (network_pu.branch_g + 1j * network_pu.branch_b) * 0.5
-    )
-    yc_to = (
-        network_pu.branch_g_to
-        + 1j * network_pu.branch_b_to
-        + (network_pu.branch_g + 1j * network_pu.branch_b) * 0.5
-    )
+    yc_from = net.branch_g_from + 1j * net.branch_b_from + (net.branch_g + 1j * net.branch_b) * 0.5
+    yc_to = net.branch_g_to + 1j * net.branch_b_to + (net.branch_g + 1j * net.branch_b) * 0.5
 
-    tap = network_pu.tap_ratio * np.exp(1j * network_pu.phase_shift)
+    tap = net.tap_ratio * np.exp(1j * net.phase_shift)
 
     yff = (ysf + yc_from) / (tap * np.conj(tap))
     yft = -ysf / np.conj(tap)
     ytf = -ysf / tap
     ytt = ysf + yc_to
 
-    f = network_pu.from_idx
-    t = network_pu.to_idx
+    f = net.from_idx
+    t = net.to_idx
     rng = np.arange(n_branch, dtype=np.int64)
 
     # Yf: (n_branch × n_bus). Row k имеет Yff[k] в столбце from_idx[k] и
@@ -124,7 +116,7 @@ def build_ybus(
 
     # Узловые шунты — на диагональ.
     bus_idx = np.arange(n_bus, dtype=np.int64)
-    bus_ysh = (network_pu.bus_g_shunt + 1j * network_pu.bus_b_shunt).astype(np.complex128)
+    bus_ysh = (net.bus_g_shunt + 1j * net.bus_b_shunt).astype(np.complex128)
 
     ybus_rows = np.concatenate([ybus_rows, bus_idx])
     ybus_cols = np.concatenate([ybus_cols, bus_idx])

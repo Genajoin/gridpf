@@ -25,9 +25,58 @@ from typing import TYPE_CHECKING
 import numpy as np
 from scipy.sparse import csr_matrix
 
+from gridpf.algebra.sbus import q_load_at
+
 
 if TYPE_CHECKING:
     from gridpf.contract.types import PFInput
+
+
+# Dead-band on the PQ→PV reverse swap: ~1% of V_set. Guards against PV↔PQ
+# oscillation at boundary conditions (MATPOWER convention).
+V_SET_DEADBAND = 1e-2
+
+
+def q_limit_violations(
+    q_gen: np.ndarray,
+    q_min: np.ndarray,
+    q_max: np.ndarray,
+    buses: np.ndarray,
+    *,
+    tol: float = 0.0,
+) -> list[tuple[float, int, float, str]]:
+    """Find buses whose ``q_gen`` leaves the deadband ``[q_min − tol, q_max + tol]``.
+
+    Single home of the violation predicate — both the PV→PQ swap loop and the
+    final ``q_violations`` report in the engine must agree on it.
+
+    Args:
+        q_gen: ``(n,)`` — generator reactive output per bus (``Q_inj + Q_load``).
+        q_min, q_max: ``(n,)`` — generator limits in p.u.; NaN = "not set",
+            such a limit never fires.
+        buses: candidate bus indices (e.g. current PV set).
+        tol: deadband width in p.u.
+
+    Returns:
+        ``(excess, bus, limit, kind)`` tuples in ``buses`` order, ``kind`` is
+        ``"qmax"`` / ``"qmin"``. A qmax violation shadows a simultaneous qmin
+        one (impossible for sane limits, mirrors the historical elif).
+    """
+    b = np.asarray(buses, dtype=np.int64)
+    if b.size == 0:
+        return []
+    qg = q_gen[b]
+    qmx = q_max[b]
+    qmn = q_min[b]
+    over = ~np.isnan(qmx) & (qg > qmx + tol)
+    under = ~np.isnan(qmn) & (qg < qmn - tol) & ~over
+    violators: list[tuple[float, int, float, str]] = []
+    for i in np.nonzero(over | under)[0].tolist():
+        if over[i]:
+            violators.append((float(qg[i] - qmx[i]), int(b[i]), float(qmx[i]), "qmax"))
+        else:
+            violators.append((float(qmn[i] - qg[i]), int(b[i]), float(qmn[i]), "qmin"))
+    return violators
 
 
 @dataclass
@@ -46,14 +95,13 @@ class QLimResult:
     pv: np.ndarray
     pq: np.ndarray
     Sbus: np.ndarray
-    v_set: np.ndarray  # заданные |V| для PV (постоянны; для не-PV игнорируется)
     locked_lim: np.ndarray  # для каждого узла: NaN, или значение Q_max/Q_min, на котором закреплён
     actions: list[QLimAction]
     changed: bool
     bus_q_gen_new: np.ndarray | None = None
     """Обновлённые значения ``bus_q_gen`` после swap'а — нужно при работе с СХН.
     На swap'нутых узлах содержит зафиксированный ``Q_lim`` (предел генератора).
-    ``None`` — если ``network_pu`` не передан (СХН не активна, swap пишет
+    ``None`` — если ``net`` не передан (СХН не активна, swap пишет
     ``Q_inj`` напрямую через ``Sbus``)."""
 
 
@@ -72,7 +120,7 @@ def enforce_q_limits(
     allow_pq_to_pv: bool = False,
     top_k: int | None = None,
     q_lim_tol: float = 0.0,
-    network_pu: PFInput | None = None,
+    net: PFInput | None = None,
     voltage_dependent_load: bool = True,
 ) -> QLimResult:
     """Применить Q-лимиты после очередного NR-прогона.
@@ -93,7 +141,7 @@ def enforce_q_limits(
             при ``Q_gen > Q_max + tol`` / ``Q_gen < Q_min − tol``. ``0.0``
             (default) — строгая проверка, прежнее поведение бит-в-бит.
             При свопе фиксируется сам лимит (не ``лимит ± tol``).
-        network_pu: при наличии (и заполненном ``bus_q_load``) включает
+        net: при наличии (и заполненном ``bus_q_load``) включает
             ГЕНЕРАТОРНУЮ семантику: Q-лимит трактуется как лимит
             **генератора** (``Q_gen``), а не суммарной инъекции;
             ``Q_load(|V|)`` вычитается из ``Q_calc``. Семантика НЕ зависит
@@ -104,7 +152,7 @@ def enforce_q_limits(
             НЕТТО-инъекцию с лимитами генератора — ложные свопы).
             При swap'е PV→PQ возвращается обновлённый ``bus_q_gen_new``,
             который вызывающий код при активной СХН подаёт в
-            ``compute_sbus`` для пересчёта ``Sbus``. Без ``network_pu``
+            ``compute_sbus`` для пересчёта ``Sbus``. Без ``net``
             swap пишет ``Q_inj`` напрямую в ``Sbus`` (legacy-поведение,
             Q-лимит = лимит нетто-инъекции).
         voltage_dependent_load: активна ли СХН в текущем расчёте. ``True`` —
@@ -113,7 +161,7 @@ def enforce_q_limits(
 
     Returns:
         :class:`QLimResult` с обновлёнными ``pv``/``pq``/``Sbus``,
-        флагом ``changed`` и списком ``actions``. При ``network_pu`` задан —
+        флагом ``changed`` и списком ``actions``. При ``net`` задан —
         также ``bus_q_gen_new``.
     """
     pv_set = set(pv.tolist())
@@ -128,19 +176,12 @@ def enforce_q_limits(
     # Гейт только на наличие данных, НЕ на нетривиальность СХН: раньше сеть
     # с константными нагрузками сравнивала нетто-инъекцию с лимитами
     # генератора и массово ложно свопала узлы «генерация + нагрузка».
-    use_load = network_pu is not None and network_pu.bus_q_load is not None
+    use_load = net is not None and net.bus_q_load is not None
     if use_load:
-        assert network_pu is not None
-        q_load_arr = network_pu.bus_q_load
-        assert q_load_arr is not None
-        b0, b1, b2 = network_pu.bus_q_b0, network_pu.bus_q_b1, network_pu.bus_q_b2
-        if voltage_dependent_load and b0 is not None and b1 is not None and b2 is not None:
-            Vm_now = np.abs(V)
-            q_load_at_v = q_load_arr * (b0 + b1 * Vm_now + b2 * Vm_now * Vm_now)
-        else:
-            q_load_at_v = np.asarray(q_load_arr, dtype=np.float64)
+        assert net is not None
+        q_load_at_v = q_load_at(net, V, voltage_dependent=voltage_dependent_load)
         bus_q_gen_new: np.ndarray | None = (
-            network_pu.bus_q_gen.copy() if network_pu.bus_q_gen is not None else None
+            net.bus_q_gen.copy() if net.bus_q_gen is not None else None
         )
     else:
         q_load_at_v = None
@@ -150,19 +191,11 @@ def enforce_q_limits(
     if pv.size > 0:
         I_bus = Ybus @ V
         S_calc = V * np.conj(I_bus)
-        # Сначала собираем список нарушителей с величиной превышения, потом
-        # переключаем либо всех (top_k=None), либо top-k самых тяжёлых.
-        violators: list[tuple[float, int, float, str]] = []
-        for k in pv.tolist():
-            qk_calc = float(S_calc[k].imag)
-            # Q_gen = Q_inj + Q_load(|V|); без СХН Q_load=0 → Q_gen = Q_inj.
-            qk_gen = qk_calc + (float(q_load_at_v[k]) if q_load_at_v is not None else 0.0)
-            qmax_k = float(q_max[k])
-            qmin_k = float(q_min[k])
-            if not np.isnan(qmax_k) and qk_gen > qmax_k + q_lim_tol:
-                violators.append((qk_gen - qmax_k, k, qmax_k, "qmax"))
-            elif not np.isnan(qmin_k) and qk_gen < qmin_k - q_lim_tol:
-                violators.append((qmin_k - qk_gen, k, qmin_k, "qmin"))
+        # Q_gen = Q_inj + Q_load(|V|); without voltage-dependent load Q_load=0.
+        # Collect violators first, then swap either all (top_k=None) or the
+        # top-k heaviest ones.
+        q_gen = S_calc.imag + (q_load_at_v if q_load_at_v is not None else 0.0)
+        violators = q_limit_violations(q_gen, q_min, q_max, pv, tol=q_lim_tol)
 
         if top_k is not None and top_k > 0 and len(violators) > top_k:
             violators.sort(reverse=True)  # по убыванию excess
@@ -201,7 +234,6 @@ def enforce_q_limits(
             pv=pv_new,
             pq=pq_new,
             Sbus=Sbus_new,
-            v_set=v_set,
             locked_lim=locked_new,
             actions=actions,
             changed=len(actions) > 0,
@@ -221,15 +253,12 @@ def enforce_q_limits(
         qlocked = float(locked_new[k])
         qmax = q_max[k]
         qmin = q_min[k]
-        # Dead-band 0.01 p.u. (≈1 % от V_set) — защищает от осцилляций
-        # PV ↔ PQ при граничных условиях. MATPOWER-конвенция.
-        v_deadband = 1e-2
-        if not np.isnan(qmax) and qlocked == qmax and vk > vk_set + v_deadband:
+        if not np.isnan(qmax) and qlocked == qmax and vk > vk_set + V_SET_DEADBAND:
             pq_set.discard(k)
             pv_set.add(k)
             locked_new[k] = np.nan
             actions.append(QLimAction(bus_idx=k, direction="pq->pv_qmax", q_value=vk))
-        elif not np.isnan(qmin) and qlocked == qmin and vk < vk_set - v_deadband:
+        elif not np.isnan(qmin) and qlocked == qmin and vk < vk_set - V_SET_DEADBAND:
             pq_set.discard(k)
             pv_set.add(k)
             locked_new[k] = np.nan
@@ -241,7 +270,6 @@ def enforce_q_limits(
         pv=pv_new,
         pq=pq_new,
         Sbus=Sbus_new,
-        v_set=v_set,
         locked_lim=locked_new,
         actions=actions,
         changed=len(actions) > 0,

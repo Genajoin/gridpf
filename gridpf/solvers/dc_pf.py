@@ -24,9 +24,15 @@ flat-старта, DC-углы дают разумную начальную то
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.linalg import spsolve
+
+
+if TYPE_CHECKING:
+    from gridpf.contract.types import PFInput
 
 
 def build_b_prime(
@@ -55,11 +61,7 @@ def build_b_prime(
 
 
 def dc_powerflow(
-    n_bus: int,
-    from_idx: np.ndarray,
-    to_idx: np.ndarray,
-    branch_x: np.ndarray,
-    tap_ratio: np.ndarray,
+    net: PFInput,
     P_inj: np.ndarray,
     ref: np.ndarray,
     pv: np.ndarray,
@@ -68,10 +70,8 @@ def dc_powerflow(
     """Вычислить углы δ (рад) через DC-приближение.
 
     Args:
-        n_bus: число шин.
-        from_idx, to_idx: индексы концов ветвей.
-        branch_x: реактивные сопротивления ветвей в p.u.
-        tap_ratio: модули комплексных коэффициентов трансформации.
+        net: p.u.-представление сети (топология берётся из ``n_bus``,
+            ``from_idx``, ``to_idx``, ``branch_x``, ``tap_ratio``).
         P_inj: ``(n_bus,)`` — активные инъекции (p.u.).
         ref: индексы slack-шин (углы фиксированы = 0).
         pv: индексы PV.
@@ -80,11 +80,12 @@ def dc_powerflow(
     Returns:
         ``(n_bus,)`` — углы δ в радианах. Slack-углы = 0.
     """
+    n_bus = net.n_bus
     pvpq = np.concatenate([pv, pq]).astype(np.int64)
     if pvpq.size == 0:
         return np.zeros(n_bus, dtype=np.float64)
 
-    B = build_b_prime(n_bus, from_idx, to_idx, branch_x, tap_ratio)
+    B = build_b_prime(n_bus, net.from_idx, net.to_idx, net.branch_x, net.tap_ratio)
     # Подматрица B' по pvpq строкам/столбцам.
     B_red = B[pvpq, :][:, pvpq]
     P_red = P_inj[pvpq]

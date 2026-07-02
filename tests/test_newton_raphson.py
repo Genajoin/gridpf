@@ -10,8 +10,9 @@ from gridpf.algebra.jacobian import build_jacobian, dSbus_dV
 from gridpf.algebra.sbus import build_sbus, classify_buses
 from gridpf.algebra.ybus import build_ybus
 from gridpf.contract.types import BASE_MVA
+from gridpf.solvers._common import mismatch, residual_vector
 from gridpf.solvers.gauss_seidel import gauss_seidel
-from gridpf.solvers.newton_raphson import _mismatch, _residual_vector, newton_raphson
+from gridpf.solvers.newton_raphson import newton_raphson
 
 
 def _three_bus_network() -> NetworkPU:
@@ -152,7 +153,7 @@ def test_residual_vector_helper() -> None:
     pv = np.array([1])
     pq = np.array([2])
     mis = np.array([0.0 + 0j, 1.0 + 2j, 3.0 + 4j])
-    f = _residual_vector(mis, pv, pq)
+    f = residual_vector(mis, pv, pq)
     np.testing.assert_array_equal(f, [1.0, 3.0, 4.0])
 
 
@@ -163,4 +164,4 @@ def test_mismatch_helper() -> None:
     V = np.array([1.0, 1.0], dtype=np.complex128)
     Sbus = np.array([1.0 + 0j, 0.0])
     # mis = V*conj(Y*V) - S = 1*2 - 1 = 1, 1*2 - 0 = 2
-    np.testing.assert_allclose(_mismatch(Ybus, V, Sbus), [1.0, 2.0])
+    np.testing.assert_allclose(mismatch(Ybus, V, Sbus), [1.0, 2.0])
