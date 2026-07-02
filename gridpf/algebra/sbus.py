@@ -24,6 +24,48 @@ if TYPE_CHECKING:
     from gridpf.contract.types import PFInput
 
 
+def _poly_eval(
+    load: np.ndarray,
+    c0: np.ndarray | float,
+    c1: np.ndarray | float,
+    c2: np.ndarray | float,
+    Vm: np.ndarray,
+) -> np.ndarray:
+    """Evaluate the polynomial load model ``load · (c0 + c1·|V| + c2·|V|²)``.
+
+    Single home of the voltage-dependent-load (ZIP-style) formula; every
+    consumer (Sbus assembly, Jacobian correction, Q-limit semantics,
+    violation reporting) must go through here instead of re-deriving it.
+    """
+    result: np.ndarray = load * (c0 + c1 * Vm + c2 * Vm * Vm)
+    return result
+
+
+def q_load_at(
+    network_pu: PFInput,
+    V: np.ndarray,
+    *,
+    voltage_dependent: bool = True,
+) -> np.ndarray:
+    """Per-bus reactive load ``Q_load(|V|)`` in p.u.
+
+    Semantics shared by the Q-limit enforcement and the final violation
+    report (generator convention: ``Q_gen = Q_inj + Q_load``):
+
+    * ``bus_q_load`` missing → zeros (no load to subtract);
+    * ``voltage_dependent=False`` or polynomial coefficients missing →
+      the constant ``bus_q_load``;
+    * otherwise → the polynomial model evaluated at ``|V|``.
+    """
+    q_load = network_pu.bus_q_load
+    if q_load is None:
+        return np.zeros(network_pu.n_bus, dtype=np.float64)
+    b0, b1, b2 = network_pu.bus_q_b0, network_pu.bus_q_b1, network_pu.bus_q_b2
+    if not voltage_dependent or b0 is None or b1 is None or b2 is None:
+        return np.asarray(q_load, dtype=np.float64)
+    return _poly_eval(np.asarray(q_load, dtype=np.float64), b0, b1, b2, np.abs(V))
+
+
 def build_sbus(network_pu: PFInput) -> np.ndarray:
     """Собрать комплексный вектор инъекций ``Sbus`` (p.u.).
 
@@ -80,8 +122,8 @@ def compute_sbus(
     assert a0 is not None and a1 is not None and a2 is not None
     assert b0 is not None and b1 is not None and b2 is not None
 
-    p_load_v = p_load * (a0 + a1 * Vm + a2 * Vm * Vm)
-    q_load_v = q_load * (b0 + b1 * Vm + b2 * Vm * Vm)
+    p_load_v = _poly_eval(p_load, a0, a1, a2, Vm)
+    q_load_v = _poly_eval(q_load, b0, b1, b2, Vm)
 
     p_gen = network_pu.bus_p_gen
     q_gen = network_pu.bus_q_gen
@@ -116,14 +158,16 @@ def load_voltage_derivatives(
     a1, a2 = network_pu.bus_p_a1, network_pu.bus_p_a2
     b1, b2 = network_pu.bus_q_b1, network_pu.bus_q_b2
 
+    # d/d|V| of the polynomial model is itself a polynomial with shifted
+    # coefficients: load·(c1 + 2·c2·|V|) == _poly_eval(load, c1, 2·c2, 0, |V|).
     if p_load is None or a1 is None or a2 is None:
         dP = np.zeros(n, dtype=np.float64)
     else:
-        dP = p_load * (a1 + 2.0 * a2 * Vm)
+        dP = _poly_eval(p_load, a1, 2.0 * a2, 0.0, Vm)
     if q_load is None or b1 is None or b2 is None:
         dQ = np.zeros(n, dtype=np.float64)
     else:
-        dQ = q_load * (b1 + 2.0 * b2 * Vm)
+        dQ = _poly_eval(q_load, b1, 2.0 * b2, 0.0, Vm)
     return dP, dQ
 
 

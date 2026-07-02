@@ -18,13 +18,19 @@ from dataclasses import replace as _dc_replace
 
 import numpy as np
 
-from gridpf.algebra.sbus import build_sbus, classify_buses, compute_sbus
+from gridpf.algebra.sbus import build_sbus, classify_buses, compute_sbus, q_load_at
 from gridpf.algebra.ybus import build_ybus
 from gridpf.contract.types import BASE_MVA, PFInput, PFOptions, PFResult
 from gridpf.solvers.dc_pf import dc_powerflow
 from gridpf.solvers.gauss_seidel import gauss_seidel
 from gridpf.solvers.newton_raphson import newton_raphson
-from gridpf.solvers.q_lims import enforce_q_limits
+from gridpf.solvers.q_lims import enforce_q_limits, q_limit_violations
+
+
+# Extra slack on top of q_lim_tol when *reporting* violations: buses that
+# enforcement pinned exactly at their limit must not be counted as violators
+# because of the final NR residual.
+_Q_VIOLATION_EPS = 1e-6
 
 
 def _has_orphan_component(network_pu: PFInput) -> bool:
@@ -414,29 +420,17 @@ def run_powerflow(
     # |V| (полином), иначе — константа bus_q_load.
     q_violations = 0
     if can_enforce and converged:
-        I_bus = ybus @ V
-        S_calc_final = V * np.conj(I_bus)
-        if network_pu.bus_q_load is None:
-            q_load_fin = np.zeros(network_pu.n_bus)
-        elif use_load_v:
-            Vm_fin = np.abs(V)
-            b0 = network_pu.bus_q_b0
-            b1 = network_pu.bus_q_b1
-            b2 = network_pu.bus_q_b2
-            assert b0 is not None and b1 is not None and b2 is not None
-            q_load_fin = network_pu.bus_q_load * (b0 + b1 * Vm_fin + b2 * Vm_fin * Vm_fin)
-        else:
-            q_load_fin = np.asarray(network_pu.bus_q_load, dtype=np.float64)
-        # Та же deadband-семантика, что и в проверке свопа: нарушение внутри
-        # q_lim_tol нарушением не считается (репортинг согласован с enforcement).
-        for k in pv_original.tolist():
-            qk_gen = float(S_calc_final[k].imag) + float(q_load_fin[k])
-            qmax_k = q_max[k] if q_max is not None else np.nan
-            qmin_k = q_min[k] if q_min is not None else np.nan
-            if (not np.isnan(qmax_k) and qk_gen > qmax_k + q_lim_tol + 1e-6) or (
-                not np.isnan(qmin_k) and qk_gen < qmin_k - q_lim_tol - 1e-6
-            ):
-                q_violations += 1
+        assert q_min is not None and q_max is not None  # guarded by can_enforce
+        S_calc_final = V * np.conj(ybus @ V)
+        q_load_fin = q_load_at(network_pu, V, voltage_dependent=use_load_v)
+        # Same deadband semantics as the swap check (shared predicate), widened
+        # by _Q_VIOLATION_EPS so reporting stays consistent with enforcement.
+        q_gen_fin = S_calc_final.imag + q_load_fin
+        q_violations = len(
+            q_limit_violations(
+                q_gen_fin, q_min, q_max, pv_original, tol=q_lim_tol + _Q_VIOLATION_EPS
+            )
+        )
 
     # Sanity-гейт правдоподобия: NR может численно сойтись (mismatch < tol)
     # в нижнюю ветвь PV-кривой (|V| ~ 0.1–0.3 p.u. при несогласованных
