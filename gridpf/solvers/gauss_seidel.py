@@ -17,27 +17,26 @@ Slack-шины не обновляются.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
 from scipy.sparse import csr_matrix
 
 from gridpf.algebra.sbus import compute_sbus
+from gridpf.solvers._common import (
+    SolverResult,
+    mismatch,
+    residual_norm,
+    residual_vector,
+    resolve_use_load,
+)
 
 
 if TYPE_CHECKING:
     from gridpf.contract.types import PFInput
 
 
-@dataclass
-class GSResult:
-    """Результат Gauss-Seidel итерации."""
-
-    V: np.ndarray
-    converged: bool
-    iterations: int
-    mismatch_max: float
+GSResult = SolverResult
 
 
 def gauss_seidel(
@@ -77,9 +76,7 @@ def gauss_seidel(
     if max_iter < 0:
         raise ValueError(f"max_iter должен быть ≥ 0, получено {max_iter}")
 
-    use_load = (
-        voltage_dependent_load and network_pu is not None and network_pu.has_voltage_dependent_load
-    )
+    use_load = resolve_use_load(network_pu, voltage_dependent_load)
 
     V = V0.astype(np.complex128, copy=True)
     Vm = np.abs(V).copy()
@@ -90,12 +87,10 @@ def gauss_seidel(
 
     # ref здесь нужен только для исключения slack из небаланса;
     # PV ∪ PQ — узлы, по активной части которых проверяется сходимость.
-    pvpq = np.concatenate([pv, pq]).astype(np.int64)
-
     # Начальный небаланс
-    mis = V * np.conj(Ybus @ V) - Sbus_local
-    f_residual = np.concatenate([mis[pvpq].real, mis[pq].imag])
-    norm_f = float(np.linalg.norm(f_residual, np.inf)) if f_residual.size else 0.0
+    mis = mismatch(Ybus, V, Sbus_local)
+    f_residual = residual_vector(mis, pv, pq)
+    norm_f = residual_norm(f_residual)
 
     if norm_f < tol or max_iter == 0:
         return GSResult(V=V, converged=norm_f < tol, iterations=0, mismatch_max=norm_f)
@@ -152,9 +147,9 @@ def gauss_seidel(
             for k in pv:
                 Sbus_local[k] = sbus_v[k].real + 1j * Sbus_local[k].imag
 
-        mis = V * np.conj(Ybus @ V) - Sbus_local
-        f_residual = np.concatenate([mis[pv].real, mis[pq].real, mis[pq].imag])
-        norm_f = float(np.linalg.norm(f_residual, np.inf)) if f_residual.size else 0.0
+        mis = mismatch(Ybus, V, Sbus_local)
+        f_residual = residual_vector(mis, pv, pq)
+        norm_f = residual_norm(f_residual)
         if norm_f < tol:
             converged = True
             break
