@@ -25,6 +25,7 @@ from scipy.sparse.csgraph import connected_components
 from gridpf.algebra.sbus import build_sbus, classify_buses, compute_sbus, q_load_at
 from gridpf.algebra.ybus import build_ybus
 from gridpf.contract.types import BASE_MVA, Method, PFInput, PFOptions, PFResult
+from gridpf.solvers._common import resolve_use_load
 from gridpf.solvers.dc_pf import dc_powerflow
 from gridpf.solvers.gauss_seidel import gauss_seidel
 from gridpf.solvers.newton_raphson import NRResult, newton_raphson
@@ -470,10 +471,11 @@ def run_powerflow(
     can_enforce = options.enforce_q_lims and net.bus_q_min is not None and net.bus_q_max is not None
 
     # СХН активна, если: пользователь не отключил, в сети есть нетривиальные
-    # коэффициенты и доступны базовые поля. Совместима с enforce_q_lims:
-    # внешний цикл swap'ов фиксирует bus_q_gen на Q-лимите, дальнейшие NR
-    # пересчитывают Sbus через compute_sbus(net, V).
-    use_load_v = options.use_load_voltage_dependency and net.has_voltage_dependent_load
+    # коэффициенты (или задан bus_v_critical: const-Z ниже крита делает
+    # voltage-dependent даже константную нагрузку) и доступны базовые поля.
+    # Совместима с enforce_q_lims: внешний цикл swap'ов фиксирует bus_q_gen
+    # на Q-лимите, дальнейшие NR пересчитывают Sbus через compute_sbus(net, V).
+    use_load_v = resolve_use_load(net, options.use_load_voltage_dependency)
     # Перестраиваем Sbus с учётом СХН на flat-старте — чтобы GS не стартовал
     # с устаревшей константой.
     if use_load_v:
@@ -561,7 +563,16 @@ def run_powerflow(
     if state.converged and options.v_plausible_range is not None:
         v_lo, v_hi = options.v_plausible_range
         vm_final = np.abs(V)
-        implausible_v_nodes = int(np.count_nonzero((vm_final < v_lo) | (vm_final > v_hi)))
+        bad = (vm_final < v_lo) | (vm_final > v_hi)
+        if cls.net.bus_v_critical is not None:
+            # Rastr U_krit semantics: узел, ушедший ниже своего критического
+            # напряжения, — ВАЛИДНОЕ состояние (нагрузка продолжена как
+            # const-Z), а не нижняя ветвь PV-кривой. Нижняя граница гейта
+            # для таких узлов не применяется; верхняя остаётся.
+            crit = np.asarray(cls.net.bus_v_critical, dtype=np.float64)
+            legal_low = np.isfinite(crit) & (crit > 0.0) & (vm_final < crit)
+            bad &= ~(legal_low & (vm_final < v_lo))
+        implausible_v_nodes = int(np.count_nonzero(bad))
         if implausible_v_nodes:
             state.converged = False
 

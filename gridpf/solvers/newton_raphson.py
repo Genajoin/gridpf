@@ -152,7 +152,15 @@ def newton_raphson(
         else:
             dS_load_dVm = None
         J = build_jacobian(Ybus, V, pv, pq, dS_load_dVm=dS_load_dVm)
-        dx = spsolve(J, -f_vec)
+        try:
+            dx = spsolve(J, -f_vec)
+        except RuntimeError:
+            # SuperLU на точно-сингулярной матрице может БРОСИТЬ RuntimeError
+            # («failed to factorize matrix») вместо NaN-вектора с warning —
+            # оба исхода означают одно и то же. Приводим к NaN-пути ниже:
+            # break с последним конечным V, mismatch=nan → singular_jacobian
+            # и DC-fallback в _engine.
+            dx = np.full_like(f_vec, np.nan)
         if not np.all(np.isfinite(dx)):
             # Сингулярный якобиан: scipy.spsolve на нём возвращает NaN-вектор
             # (с MatrixRankWarning), а НЕ исключение. Прерываем с последним

@@ -46,5 +46,16 @@ def residual_norm(f: np.ndarray) -> float:
 
 
 def resolve_use_load(net: PFInput | None, voltage_dependent_load: bool) -> bool:
-    """Return whether voltage-dependent load handling is active for this run."""
-    return voltage_dependent_load and net is not None and net.has_voltage_dependent_load
+    """Return whether voltage-dependent load handling is active for this run.
+
+    True when the polynomial load model is present, or when the network
+    carries ``bus_v_critical`` (Rastr U_krit semantics: constant-impedance
+    continuation below the critical voltage makes even constant loads
+    voltage-dependent, so Sbus must be recomputed per iteration and the
+    Jacobian must carry the load derivative).
+    """
+    if not voltage_dependent_load or net is None:
+        return False
+    if net.has_voltage_dependent_load:
+        return True
+    return net.bus_v_critical is not None and net.bus_p_load is not None
