@@ -106,6 +106,17 @@ class PFInput:
     bus_v_set: np.ndarray | None = None
     bus_va_set: np.ndarray | None = None
 
+    # Критическое напряжение нагрузки (p.u., Rastr U_krit semantics). Ниже
+    # ``bus_v_critical[i]`` нагрузка узла продолжается как const-Z:
+    #   S_load(|V|) = S_load(V_crit) · (|V| / V_crit)²
+    # — полином СХН (или константная нагрузка) вычисляется в точке V_crit и
+    # масштабируется квадратично, поэтому фидер, нагруженный «за носом»
+    # PV-кривой, остаётся разрешимым (const-Z не создаёт предела передаваемой
+    # мощности). NaN у узла → семантика выключена для него. ``None`` (default)
+    # — выключено для всей сети, бит-в-бит прежнее поведение. Заполняется
+    # адаптером (типовое значение Растра — 0.7·Vnom → 0.7 p.u.).
+    bus_v_critical: np.ndarray | None = None
+
     base_mva: float = BASE_MVA
 
     @property
