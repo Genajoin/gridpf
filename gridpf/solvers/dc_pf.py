@@ -46,11 +46,12 @@ def build_b_prime(
 
     Конвенция MATPOWER: ``B'_kk = Σ 1/x_l`` для всех инцидентных ветвей,
     ``B'_kj = -1/x_l`` (если ветвь l между k и j). Tap-ratio влияет: эквивалент
-    последовательного импеданса x умножается на ``|t|`` (упрощение
-    PSERC dcpf). Шунты и фазоповорот игнорируются.
+    последовательного импеданса ``x / |t|`` — модуль взаимной проводимости
+    ``|Yft| = |t|/x`` при сопротивлении на стороне «от» (см.
+    ``gridpf.algebra.ybus``). Шунты и фазоповорот игнорируются.
     """
     # Защита от R≈0 уже в адаптере, но x может быть 0 в специальных случаях.
-    x = np.where(branch_x == 0, 1e-9, branch_x) * np.maximum(tap_ratio, 1e-9)
+    x = np.where(branch_x == 0, 1e-9, branch_x) / np.maximum(tap_ratio, 1e-9)
     b = 1.0 / x
     rows = np.concatenate([from_idx, to_idx, from_idx, to_idx])
     cols = np.concatenate([from_idx, to_idx, to_idx, from_idx])
