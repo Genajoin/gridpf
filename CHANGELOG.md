@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases are cut from Conventional Commits via `cz bump`; the git tag is the
 authoritative version (`setuptools_scm`).
 
-## Unreleased
+## v0.5.0 (2026-10-10)
 
 ### BREAKING CHANGE
 
