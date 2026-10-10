@@ -98,6 +98,11 @@ def test_incompatible_major_rejected() -> None:
     assert not is_data_compatible(bumped_major)
 
 
+def test_pre_from_shunt_data_rejected() -> None:
+    """1.x data carries the old "from" shunt meaning (divided by |t|²)."""
+    assert not is_data_compatible("1.0.0")
+
+
 def test_validate_detects_shape_mismatch(two_bus: PFInput) -> None:
     bad = two_bus
     bad.bus_p_injection = np.zeros(two_bus.n_bus + 1)  # сломанная длина

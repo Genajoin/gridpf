@@ -16,9 +16,11 @@ authoritative version (`setuptools_scm`).
   connected at the "from" node, in the "from"-side base, before the ideal
   transformer. `build_ybus` no longer divides it by `|t|²`
   (`Yff = Ysf + Yc_from`; `Yft`, `Ytf`, `Ytt` are unchanged), so it no longer
-  depends on the tap. The contract schema is unchanged (`CONTRACT_VERSION`
-  stays 1.0.0), but the meaning of the "from" shunt fields on branches with an
-  off-nominal ratio changes: inputs that relied on the division (a "from" shunt
+  depends on the tap. The contract schema is unchanged, but the meaning of the
+  "from" shunt fields on branches with an off-nominal ratio changes, so
+  `CONTRACT_VERSION` is bumped to 2.0.0 and `.npz` inputs saved under 1.x are
+  rejected by `load_pf_input_npz`; the version policy now treats a change of
+  the meaning of an existing field as MAJOR. Inputs that relied on the division (a "from" shunt
   behind the ideal transformer, as in the `makeYbus` form) must divide that
   shunt by `|t|²` themselves. Branches with `|t| = 1` in p.u. and branches
   without a "from" shunt are not affected. Branch flows, `branch_loss_p` /
