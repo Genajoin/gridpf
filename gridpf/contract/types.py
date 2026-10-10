@@ -61,6 +61,8 @@ class PFInput:
     branch_g: np.ndarray  # суммарный шунт G ветви (Π-схема)
     branch_b: np.ndarray  # суммарный шунт B ветви (Π-схема)
     branch_g_from: np.ndarray  # шунт со стороны «от»
+    # The "from" shunt (with half of branch_g/branch_b) is connected at the
+    # "from" node before the ideal transformer: tap-independent, see algebra.ybus.
     branch_b_from: np.ndarray
     branch_g_to: np.ndarray  # шунт со стороны «до»
     branch_b_to: np.ndarray

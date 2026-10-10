@@ -14,6 +14,11 @@
   поле. Данные более старого minor по-прежнему читаются.
 * **PATCH** — изменения, не затрагивающие схему (документация, валидаторы).
 
+A change of the physical meaning of an existing field is also **MAJOR**, even
+when the schema is unchanged: data produced under the old meaning would pass
+the compatibility check and be silently misread (2.0.0: the transformer
+"from" shunt moved before the ideal transformer).
+
 Версия едет с сериализованными данными как метаданные
 (:data:`CONTRACT_VERSION_KEY`); на входе gridpf проверяет совместимость.
 """
@@ -26,7 +31,8 @@ from dataclasses import dataclass
 # Текущая версия контракта данных PF. Стартуем с 1.0.0 — первая явная фиксация
 # контракта. Бамп — по политике выше; синхронно обновлять при изменении
 # :mod:`gridpf.contract.types`.
-CONTRACT_VERSION = "1.0.0"
+# 2.0.0: meaning of branch_g_from/branch_b_from changed (see algebra.ybus).
+CONTRACT_VERSION = "2.0.0"
 
 # Ключ, под которым версия контракта кладётся в метаданные сериализованных
 # данных. Валидатор читает его на входе.
