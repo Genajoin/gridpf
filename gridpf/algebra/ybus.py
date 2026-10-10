@@ -14,10 +14,16 @@
     t       = tap_ratio · exp(j·phase_shift)        # комплексный коэф.
     Ys      = Ysf · |t|²               # см. ниже про сторону сопротивления
 
-    Yff = (Ys + Yc_from) / (t · conj(t))  = Ysf + Yc_from / |t|²
+    Yff = Ys / (t · conj(t)) + Yc_from    = Ysf + Yc_from
     Yft = − Ys / conj(t)                  = − Ysf · t
     Ytf = − Ys / t                        = − Ysf · conj(t)
     Ytt = Ys + Yc_to                      = Ysf · |t|² + Yc_to
+
+Branch layout. A branch is the series impedance at its "from" end followed by
+the ideal transformer ``t : 1`` at its "to" end::
+
+    from ──┬── r + j·x ──( t : 1 )──┬── to
+         Yc_from                   Yc_to
 
 Сторона сопротивления. Во входном формате ``resistance``/``reactance``
 трансформатора — Омы на стороне «от»: сопротивление включено у начала ветви,
@@ -30,7 +36,13 @@
 РПН. У линий и трансформаторов с номинальным коэффициентом ``|t| = 1``
 приведения нет: ``Ys = Ysf``.
 
-Шунт «от» делится на ``|t|²``.
+Shunt side. The whole "from" shunt ``Yc_from`` is connected at the "from"
+node, in the "from"-side base, *before* the ideal transformer: it is neither
+divided by ``|t|²`` nor otherwise dependent on the tap position. The "to"
+shunt ``Yc_to`` is connected at the "to" node, behind the ideal transformer.
+A source model that places a "from" shunt behind the ideal transformer (the
+``makeYbus`` form ``(Ys + Yc)/|t|²``) must be converted on input by dividing
+that shunt by ``|t|²``.
 
 Шунты узлов добавляются на диагональ ``Ybus``; параллельные ветви
 суммируются автоматически через ``coo_matrix``-сборку с одинаковыми
@@ -110,7 +122,9 @@ def build_ybus(
     # трансформатор фактическим коэффициентом, см. docstring модуля.
     ys = series_admittance(net)
 
-    yff = (ys + yc_from) / (tap * np.conj(tap))
+    # The "from" shunt sits at the "from" node before the ideal transformer:
+    # no division by |t|^2 (see the module docstring).
+    yff = ys / (tap * np.conj(tap)) + yc_from
     yft = -ys / np.conj(tap)
     ytf = -ys / tap
     ytt = ys + yc_to
