@@ -255,6 +255,10 @@ class PFOptions:
             in the order of the referred series impedance from the slack,
             loads with ``P > 0, Q > 0`` taken as admittances at the current
             ``|V|`` (see :mod:`gridpf.solvers.gauss_seidel_ordered`).
+        gs_min_x: ``"ordered"`` mode — scale of the small inductive reactance
+            that replaces a series-capacitive branch (``x < 0``) during
+            Gauss-Seidel: ``x_eq = 55·gs_min_x·U_from`` Ω, ``U_from`` — nominal
+            voltage of the branch "from" bus in kV (``4e-6`` → ``2.2e-4·U`` Ω).
         gs_guard: discard the Gauss-Seidel result and start Newton from the
             pre-GS voltage when GS made the residual worse, produced a
             non-finite value or left ``step_v_corridor``. ``False`` — off.
@@ -290,6 +294,7 @@ class PFOptions:
     q_lim_v_deadband: float = 1e-5
     q_lim_max_returns: int = 4
     gs_mode: GSMode = "classic"
+    gs_min_x: float = 4e-6
     gs_guard: bool = False
     init_v_max_mismatch: float | None = None
 

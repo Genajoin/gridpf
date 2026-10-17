@@ -20,9 +20,9 @@ iteration, robust on networks with very small series impedances (breakers):
   only the generation stays an injection. The base ``Ybus`` is untouched.
 * **Series capacitances shorted** — a branch whose series admittance
   ``g + jb = 1/(r + jx)`` has ``b > 0`` (``x < 0``, e.g. a star branch of a
-  three-winding transformer) gets ``b := −U_from / _GS_NEG_X_PU_KV`` (a small
-  inductive reactance proportional to the nominal voltage of its "from" bus,
-  ``g`` kept) in a Gauss-Seidel-only copy of ``Ybus``; the order is built
+  three-winding transformer) gets ``b := −1/x_eq`` with the small inductive
+  reactance ``x_eq = 55·min_x·U_from`` Ω (``U_from`` — nominal voltage of its
+  "from" bus, kV; ``g`` kept) in a Gauss-Seidel-only copy of ``Ybus``; the order is built
   from the original parameters and Newton keeps the original ``Ybus``.
 * PV buses: ``Q`` from the balance at the current voltages, the voltage
   update, then ``|V| = V_set`` with the angle kept. ``ω = 1``; a non-finite
@@ -55,14 +55,15 @@ if TYPE_CHECKING:
     from gridpf.contract.types import PFInput
 
 
-# Gauss-Seidel substitute for a series-capacitive branch (x < 0): an inductive
-# reactance of 0.022/U_kV p.u. (U — nominal voltage of the "from" bus, kV),
-# i.e. b = −U_kV / 0.022 p.u. on the 100 MVA base.
-_GS_NEG_X_PU_KV = 0.022
+# Ohm per (kV · unit of min_x) of the substitute reactance x_eq = 55·min_x·U.
+_GS_SHORT_X_OHM_PER_KV = 55.0
 
 
-def _gs_ybus(net: PFInput, Ybus: csr_matrix) -> csr_matrix:
-    """``Ybus`` with series-capacitive branches shorted (Gauss-Seidel only)."""
+def _gs_ybus(net: PFInput, Ybus: csr_matrix, min_x: float) -> csr_matrix:
+    """``Ybus`` with series-capacitive branches shorted (Gauss-Seidel only).
+
+    In p.u. ``x_eq = 55·min_x·U·S_base/U² = 55·min_x·S_base/U`` (``U`` in kV).
+    """
     r = np.asarray(net.branch_r, dtype=np.float64)
     x = np.asarray(net.branch_x, dtype=np.float64)
     y = 1.0 / (r + 1j * x)
@@ -71,7 +72,8 @@ def _gs_ybus(net: PFInput, Ybus: csr_matrix) -> csr_matrix:
         return Ybus
     u_from = np.asarray(net.bus_vn_kv, dtype=np.float64)[np.asarray(net.from_idx)]
     y_new = y.copy()
-    y_new[cap] = y[cap].real - 1j * u_from[cap] / _GS_NEG_X_PU_KV
+    x_eq = _GS_SHORT_X_OHM_PER_KV * min_x * net.base_mva / u_from[cap]
+    y_new[cap] = y[cap].real - 1j / x_eq
     z_new = 1.0 / y_new
     shorted = replace(net, branch_r=z_new.real, branch_x=z_new.imag)
     return build_ybus(shorted)[0]
@@ -133,6 +135,7 @@ def gauss_seidel_ordered(
     net: PFInput,
     passes: int,
     tol: float,
+    min_x: float = 4e-6,
     voltage_dependent_load: bool = False,
 ) -> SolverResult:
     """Run ``passes`` ordered Gauss-Seidel passes from ``V0``.
@@ -146,6 +149,8 @@ def gauss_seidel_ordered(
         net: the network (branches for the order, load/generation split).
         passes: number of passes (no convergence criterion).
         tol: only sets the ``converged`` flag of the result.
+        min_x: scale of the reactance shorting series-capacitive branches,
+            ``x_eq = 55·min_x·U_from[kV]`` Ω.
         voltage_dependent_load: whether the load model depends on ``|V|``.
     """
     if passes < 0:
@@ -161,7 +166,9 @@ def gauss_seidel_ordered(
     split = split and net.bus_p_gen is not None and net.bus_q_gen is not None
     s_gen = np.asarray(net.bus_p_gen) + 1j * np.asarray(net.bus_q_gen) if split else None
 
-    Y_gs = _gs_ybus(net, Ybus)
+    if not min_x > 0.0:
+        raise ValueError(f"min_x must be > 0, got {min_x}")
+    Y_gs = _gs_ybus(net, Ybus, min_x)
     Y_gs.sort_indices()
     y_data, y_idx, y_indptr = Y_gs.data, Y_gs.indices, Y_gs.indptr
     diag_y = np.asarray(Y_gs.diagonal())

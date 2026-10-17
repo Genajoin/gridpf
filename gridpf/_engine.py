@@ -651,6 +651,7 @@ def run_powerflow(
                 net=cls.net,
                 passes=options.max_iter_gs,
                 tol=gs_tol,
+                min_x=options.gs_min_x,
                 voltage_dependent_load=use_load_v,
             )
         else:

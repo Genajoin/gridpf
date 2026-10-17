@@ -158,9 +158,9 @@ class TestSeriesCapacitance:
 
         net = replace(_net(build_net), branch_x=np.array([0.05, -0.0015, 0.06, 0.3]))
         ybus, _, _ = build_ybus(net)
-        y_gs = _gs_ybus(net, ybus)
+        y_gs = _gs_ybus(net, ybus, 4e-6)
         y_old = 1.0 / (0.0 - 0.0015j)
-        y_new = y_old.real - 1j * 110.0 / 0.022
+        y_new = y_old.real - 1j * 110.0 / 0.022  # x_eq = 0.022/U p.u. at min_x = 4e-6
         assert y_gs[1, 2] == pytest.approx(-y_new)
         assert ybus[1, 2] == pytest.approx(-y_old)  # the Newton Ybus is untouched
         # other branches unchanged
@@ -171,4 +171,4 @@ class TestSeriesCapacitance:
 
         net = _net(build_net)
         ybus, _, _ = build_ybus(net)
-        assert _gs_ybus(net, ybus) is ybus
+        assert _gs_ybus(net, ybus, 4e-6) is ybus
