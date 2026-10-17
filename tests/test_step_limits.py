@@ -93,6 +93,17 @@ class TestCorridor:
             == 0.0
         )
 
+    def test_already_outside_is_left_to_newton(self) -> None:
+        # Already below the corridor (incl. a transient negative modulus) and
+        # moving further out: rolling it onto the boundary would need a < −1.
+        Vm_old = np.array([0.45, -0.47])
+        Vm_new = np.array([0.30, -0.50])
+        Va = np.zeros(2)
+        assert (
+            corridor_correction(Vm_old, Va, Vm_new, Va, StepLimits(v_corridor=(0.5, 2.0)), None)
+            == 0.0
+        )
+
     def test_branch_angle(self) -> None:
         Vm = np.ones(2)
         pairs = (np.array([0]), np.array([1]))

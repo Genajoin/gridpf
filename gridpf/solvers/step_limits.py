@@ -18,7 +18,7 @@ preserved.
 
 2. **Corridor correction** (after the step, from the second iteration on):
    if a bus modulus left ``[v_lo, v_hi]`` or a branch angle difference
-   exceeded ``max_branch_angle`` *while moving outward* in this step, the
+   exceeded ``max_branch_angle`` — crossing the boundary in this step — the
    whole applied step is rolled back by one factor so that the worst
    violator lands exactly on the boundary; the other buses move back
    proportionally. One correction per iteration, no repetition.
@@ -140,20 +140,24 @@ def corridor_correction(
     limits: StepLimits,
     pairs: tuple[np.ndarray, np.ndarray] | None,
 ) -> float:
-    """Fraction ``a ∈ [−1, 0]`` of the applied step to roll back.
+    """Fraction ``a ∈ (−1, 0]`` of the applied step to roll back.
 
-    Only outward motion counts as a violation: a bus already outside the
-    corridor that moves back towards it is left alone. ``0.0`` means no
-    correction.
+    Only a *crossing* counts as a violation: a bus (branch) strictly inside the
+    corridor before the step and outside after it. Buses already outside —
+    including the transient negative moduli the polar iteration can pass
+    through — are left to Newton: forcing them onto the boundary would need
+    ``a < −1`` (a step back past the previous point) and stalls the
+    iteration. ``0.0`` means no correction.
     """
     a = 0.0
     if limits.v_corridor is not None:
         v_lo, v_hi = limits.v_corridor
+        inside = (Vm_old > v_lo) & (Vm_old < v_hi)
         d = Vm_new - Vm_old
-        up = (Vm_new > v_hi) & (d > 0.0)
+        up = inside & (Vm_new > v_hi)
         if up.any():
             a = min(a, float(np.min((v_hi - Vm_new[up]) / d[up])))
-        down = (Vm_new < v_lo) & (d < 0.0)
+        down = inside & (Vm_new < v_lo)
         if down.any():
             a = min(a, float(np.min((v_lo - Vm_new[down]) / d[down])))
     if limits.max_branch_angle is not None and pairs is not None and pairs[0].size:
@@ -161,7 +165,7 @@ def corridor_correction(
         th_new = np.abs(Va_new[i] - Va_new[j])
         th_old = np.abs(Va_old[i] - Va_old[j])
         dth = np.abs((Va_new[i] - Va_new[j]) - (Va_old[i] - Va_old[j]))
-        out = (th_new > limits.max_branch_angle) & (th_new > th_old) & (dth > 0.0)
+        out = (th_old < limits.max_branch_angle) & (th_new > limits.max_branch_angle)
         if out.any():
             a = min(a, float(np.min((limits.max_branch_angle - th_new[out]) / dth[out])))
     return max(a, -1.0)

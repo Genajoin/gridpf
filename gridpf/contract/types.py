@@ -178,7 +178,7 @@ class PFOptions:
         step_max_branch_dva: Newton step scaling on the per-branch
             angle-difference step ``|Δδ_i − Δδ_j|``, rad.
         step_v_corridor: ``(v_lo, v_hi)`` p.u. — post-step corridor: a bus
-            leaving it outward rolls the whole step back onto the boundary
+            crossing its boundary rolls the whole step back onto it
             (from the second Newton iteration on).
         step_max_branch_angle: post-step corridor on ``|δ_i − δ_j|`` over
             branches, rad.
