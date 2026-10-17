@@ -156,6 +156,48 @@ def _nr_tols(options: PFOptions) -> tuple[float, float | None]:
     return tol_p, tol_q
 
 
+def _run_gs(
+    Ybus: csr_matrix,
+    Sbus: np.ndarray,
+    V0: np.ndarray,
+    ref: np.ndarray,
+    pv: np.ndarray,
+    pq: np.ndarray,
+    *,
+    net: PFInput,
+    options: PFOptions,
+    tol: float,
+    use_load: bool,
+) -> NRResult:
+    """Gauss-Seidel warm start in the mode selected by ``options.gs_mode``."""
+    if options.gs_mode == "ordered":
+        return gauss_seidel_ordered(
+            Ybus,
+            Sbus,
+            V0,
+            ref,
+            pv,
+            pq,
+            net=net,
+            passes=options.max_iter_gs,
+            tol=tol,
+            min_x=options.gs_min_x,
+            voltage_dependent_load=use_load,
+        )
+    return gauss_seidel(
+        Ybus,
+        Sbus,
+        V0,
+        ref,
+        pv,
+        pq,
+        tol=tol,
+        max_iter=options.max_iter_gs,
+        net=net,
+        voltage_dependent_load=use_load,
+    )
+
+
 def _residual_norm_at(
     Ybus: csr_matrix, V: np.ndarray, Sbus: np.ndarray, pv: np.ndarray, pq: np.ndarray
 ) -> float:
@@ -376,6 +418,46 @@ def _nr_inner_q_limits(
     return len(q_ctrl.actions), pre_swap_net
 
 
+def _dc_retry_with_q_limits(
+    state: _NRState,
+    cls: _Classification,
+    cls_initial: _Classification,
+    Ybus: csr_matrix,
+    ref: np.ndarray,
+    *,
+    options: PFOptions,
+    use_load: bool,
+    pv_original: np.ndarray,
+    v_set_arr: np.ndarray,
+) -> int:
+    """Q-limit pass from a DC-angle start; keeps the previous state on failure.
+
+    Returns the number of Q-limit switches it made.
+    """
+    state_before = _dc_replace(state)
+    cls_before = _dc_replace(cls)
+    cls.restore(cls_initial)
+    state.V = _dc_start(cls.net)
+    swaps, _ = _nr_with_q_limits(
+        state,
+        cls,
+        Ybus,
+        ref,
+        options=options,
+        use_load=use_load,
+        can_enforce=True,
+        pv_original=pv_original,
+        v_set_arr=v_set_arr,
+    )
+    if state.converged:
+        return swaps
+    iters = state.iters_nr
+    state.V, state.mismatch, state.converged = state_before.V, state_before.mismatch, False
+    state.iters_nr = iters
+    cls.restore(cls_before)
+    return 0
+
+
 def _soft_fallback(
     state: _NRState,
     cls: _Classification,
@@ -408,17 +490,17 @@ def _soft_fallback(
     # Для устойчивости — повторный flat + GS warm-start.
     V_fb = _apply_setpoints(net_orig, _flat_start(net_orig))
     if options.method in ("gs", "gs+nr"):
-        gs_fb = gauss_seidel(
+        gs_fb = _run_gs(
             Ybus,
             sbus_orig,
             V_fb,
             ref_orig,
             pv_orig_arr,
             pq_orig_arr,
-            tol=options.gs_tol,
-            max_iter=options.max_iter_gs,
             net=net_orig,
-            voltage_dependent_load=use_load,
+            options=options,
+            tol=options.gs_tol,
+            use_load=use_load,
         )
         V_fb = gs_fb.V
     nr_fb = newton_raphson(
@@ -441,6 +523,16 @@ def _soft_fallback(
         cls.pv = pv_orig_arr
 
 
+def _dc_start(net: PFInput) -> np.ndarray:
+    """Flat moduli with setpoints, angles from the DC power flow."""
+    ref_d, pv_d, pq_d = classify_buses(net.bus_type)
+    delta_dc = dc_powerflow(net, P_inj=build_sbus(net).real, ref=ref_d, pv=pv_d, pq=pq_d)
+    # Стартовое V для NR: модули как в flat+setpoints, углы из DC.
+    V_dc = _apply_setpoints(net, _flat_start(net))
+    result: np.ndarray = np.abs(V_dc) * np.exp(1j * delta_dc)
+    return result
+
+
 def _dc_fallback(
     state: _NRState,
     cls: _Classification,
@@ -455,16 +547,7 @@ def _dc_fallback(
     """
     ref_d, pv_d, pq_d = classify_buses(cls.net.bus_type)
     sbus_d = build_sbus(cls.net)
-    delta_dc = dc_powerflow(
-        cls.net,
-        P_inj=sbus_d.real,
-        ref=ref_d,
-        pv=pv_d,
-        pq=pq_d,
-    )
-    # Стартовое V для NR: модули как в flat+setpoints, углы из DC.
-    V_dc = _apply_setpoints(cls.net, _flat_start(cls.net))
-    V_dc = np.abs(V_dc) * np.exp(1j * delta_dc)
+    V_dc = _dc_start(cls.net)
     nr_dc = newton_raphson(
         Ybus,
         sbus_d,
@@ -639,34 +722,18 @@ def run_powerflow(
 
     # GS warm-start выполняется один раз — переключения PV/PQ затрагивают только NR-фазу.
     if method in ("gs", "gs+nr"):
-        gs_tol = options.tol if method == "gs" else options.gs_tol
-        if options.gs_mode == "ordered":
-            gs_res = gauss_seidel_ordered(
-                Ybus,
-                cls.Sbus,
-                V0,
-                ref,
-                cls.pv,
-                cls.pq,
-                net=cls.net,
-                passes=options.max_iter_gs,
-                tol=gs_tol,
-                min_x=options.gs_min_x,
-                voltage_dependent_load=use_load_v,
-            )
-        else:
-            gs_res = gauss_seidel(
-                Ybus,
-                cls.Sbus,
-                V0,
-                ref,
-                cls.pv,
-                cls.pq,
-                tol=gs_tol,
-                max_iter=options.max_iter_gs,
-                net=cls.net,
-                voltage_dependent_load=use_load_v,
-            )
+        gs_res = _run_gs(
+            Ybus,
+            cls.Sbus,
+            V0,
+            ref,
+            cls.pv,
+            cls.pq,
+            net=cls.net,
+            options=options,
+            tol=options.tol if method == "gs" else options.gs_tol,
+            use_load=use_load_v,
+        )
         state.V = gs_res.V
         iters_gs = gs_res.iterations
         state.mismatch = gs_res.mismatch_max
@@ -677,7 +744,9 @@ def run_powerflow(
             state.V = V0
 
     # Внешний цикл по Q-лимитам. Без enforce_q_lims — ровно одна итерация NR.
+    q_lims_dropped = False
     if method in ("nr", "gs+nr"):
+        cls_initial = _dc_replace(cls)
         q_lim_swaps, pre_swap_net = _nr_with_q_limits(
             state,
             cls,
@@ -689,8 +758,24 @@ def run_powerflow(
             pv_original=pv_original,
             v_set_arr=v_set_arr,
         )
+        if can_enforce and not state.converged and options.dc_fallback:
+            # The Q limits were asked for: retry them from a DC-angle start
+            # (same mode, initial classification) before giving them up.
+            q_lim_swaps += _dc_retry_with_q_limits(
+                state,
+                cls,
+                cls_initial,
+                Ybus,
+                ref,
+                options=options,
+                use_load=use_load_v,
+                pv_original=pv_original,
+                v_set_arr=v_set_arr,
+            )
         # Soft-fallback: если ничего не помогло, отказываемся от enforcement
-        # и возвращаемся к классификации **без переключений**.
+        # и возвращаемся к классификации **без переключений**. Such a solution
+        # is not reported as converged (failure_reason
+        # "converged_without_q_lims").
         if can_enforce and not state.converged:
             _soft_fallback(
                 state,
@@ -700,17 +785,19 @@ def run_powerflow(
                 use_load=use_load_v,
                 pre_swap_net=pre_swap_net,
             )
+            q_lims_dropped = state.converged
 
     # DC warm-start fallback: если NR-расчёт (с/без enforcement) разошёлся,
     # пробуем линеаризованное DC-приближение для углов и стартуем NR ещё раз.
     if options.dc_fallback and not state.converged and method in ("nr", "gs+nr"):
         _dc_fallback(state, cls, Ybus, options=options, use_load=use_load_v)
+        q_lims_dropped = q_lims_dropped or (can_enforce and state.converged)
 
     V = state.V
     s_from, s_to = _branch_flows(cls.net, V, Yf, Yt)
 
     q_violations = 0
-    if can_enforce and state.converged:
+    if can_enforce and (state.converged or q_lims_dropped):
         q_violations = _count_q_violations(
             cls.net,
             V,
@@ -741,7 +828,12 @@ def run_powerflow(
             state.converged = False
 
     failure_reason = ""
-    if not state.converged:
+    if can_enforce and state.converged and (q_lims_dropped or q_violations):
+        # With enforce_q_lims a solution that ignores or violates the limits is
+        # never reported as converged.
+        state.converged = False
+        failure_reason = "converged_without_q_lims" if q_lims_dropped else "infeasible_q_lims"
+    elif not state.converged:
         failure_reason = _classify_failure(
             cls.net,
             state.mismatch,

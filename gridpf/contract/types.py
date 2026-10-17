@@ -331,7 +331,12 @@ class PFResult:
     failure_reason: str = ""
     """Если ``converged=False`` — короткий код причины: ``max_iter_reached``,
     ``singular_jacobian``, ``no_slack_component``, ``voltage_collapse``,
-    ``infeasible_q_lims``, ``implausible_voltage``. Пустая строка при успехе."""
+    ``infeasible_q_lims``, ``implausible_voltage``, ``converged_without_q_lims``.
+    Пустая строка при успехе. With ``enforce_q_lims=True`` a solution that
+    violates the generator Q limits is never ``converged``: ``infeasible_q_lims``
+    when the Q-limit pass ended with violations, ``converged_without_q_lims``
+    when only the fallback without Q limits solved it (``V`` is that solution,
+    ``q_violations`` counts its violations)."""
     implausible_v_nodes: int = 0
     """Узлов с ``|V|`` вне ``v_plausible_range`` в численно сошедшемся решении
     (>0 ⇒ ``converged=False``, ``failure_reason="implausible_voltage"``)."""

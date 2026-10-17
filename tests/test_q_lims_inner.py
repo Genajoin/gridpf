@@ -203,3 +203,58 @@ class TestController:
         assert released.tolist() == [0] and not undo
         released, undo = ctrl.step_check(np.array([1.0, 1.12], dtype=np.complex128))
         assert released.tolist() == [1] and undo
+
+
+def _infeasible_net(build_net: Callable[..., PFInput]) -> PFInput:
+    # A weak tie and a generator with a tiny Q range: solvable only without limits.
+    return build_net(
+        bus_type=[2, 1, 0],
+        edges=[(0, 1, 0.02, 0.5), (1, 2, 0.01, 0.05)],
+        p_inj=[0.0, 0.0, -0.9],
+        q_inj=[0.0, 0.0, -0.45],
+        bus_v_set=[1.0, 1.0, np.nan],
+        bus_va_set=[0.0, np.nan, np.nan],
+        q_min=[np.nan, -0.01, np.nan],
+        q_max=[np.nan, 0.01, np.nan],
+    )
+
+
+class TestHonestStatus:
+    @pytest.mark.parametrize("mode", ["outer", "inner"])
+    def test_solution_without_limits_is_not_converged(
+        self, build_net: Callable[..., PFInput], mode: str
+    ) -> None:
+        net = _infeasible_net(build_net)
+        assert solve(net, PFOptions()).converged
+        res = solve(net, PFOptions(enforce_q_lims=True, q_lim_mode=mode))  # type: ignore[arg-type]
+        assert not res.converged
+        # inner: only the fallback without limits solves it; outer rolls its
+        # last swap back inside the loop and ends with the violation.
+        expected = "converged_without_q_lims" if mode == "inner" else "infeasible_q_lims"
+        assert res.failure_reason == expected
+        assert res.q_violations > 0
+
+    def test_never_converged_with_violations(self, build_net: Callable[..., PFInput]) -> None:
+        for q_max in (0.01, 0.05, 0.2, 5.0):
+            for mode in ("outer", "inner"):
+                net = _gen_net(build_net, q_max=q_max)
+                res = solve(net, PFOptions(enforce_q_lims=True, q_lim_mode=mode))  # type: ignore[arg-type]
+                assert not (res.converged and res.q_violations > 0)
+
+    def test_dc_retry_keeps_the_limits(
+        self, build_net: Callable[..., PFInput], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import gridpf._engine as engine
+        from gridpf.solvers._common import SolverResult
+
+        net = _gen_net(build_net)
+        ref = solve(net, INNER)
+
+        def ruined_gs(*args: object, **kwargs: object) -> SolverResult:
+            V = np.asarray(args[2]) * 0.0  # zero voltage: singular first Jacobian
+            return SolverResult(V=V, converged=False, iterations=1, mismatch_max=1.0)
+
+        monkeypatch.setattr(engine, "gauss_seidel", ruined_gs)
+        res = solve(net, INNER)
+        assert res.converged and res.q_lim_swaps >= 1 and res.q_violations == 0
+        np.testing.assert_allclose(res.V, ref.V, atol=1e-7)
