@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases are cut from Conventional Commits via `cz bump`; the git tag is the
 authoritative version (`setuptools_scm`).
 
+## v0.6.1 (2026-10-17)
+
+### Fix
+
+- DC warm start anchored at the slack set angles (`bus_va_set`). It solved
+  with every slack angle at zero, and Newton keeps the slack fixed, so a
+  fallback through it lost the set angles: multi-slack models converged to a
+  different regime. Results change only for runs that reach the DC fallback
+  with non-zero slack angles; they now match the Newton-only solution.
+- Q-limit violations are counted with the deadband widened by the Newton
+  reactive tolerance (`tol_q`) when it exceeds the fixed epsilon, so a bus
+  pinned at its limit is not reported as a violation because of the reactive
+  residual (a correct solution was flagged `infeasible_q_lims` with a loose
+  `tol_q`). Unchanged with the default tolerance.
+
+## v0.6.0 (2026-10-17)
+
+### Feat
+
+- Contract 2.1.0 (optional fields only): `PFInput.bus_q_lock` — PV buses
+  starting pinned at a Q limit; piecewise-polynomial load models
+  (`load_model_seg_ptr` / `load_model_seg_v_lo` / `load_model_seg_coef`,
+  `bus_p_load_model` / `bus_q_load_model`), the lower segment applies at a
+  boundary.
+- `q_lim_mode="inner"`: Q-limit switching inside the Newton iteration with a
+  relative PQ→PV deadband and a per-bus return cap.
+- Newton step limits and a post-step voltage/angle corridor (`step_*`).
+- Separate Newton tolerances `tol_p` / `tol_q`.
+- `gs_mode="ordered"` Gauss-Seidel warm start, `gs_guard`,
+  `init_v_max_mismatch`, `gs_min_x`.
+
+All new options are off by default (bit-for-bit).
+
+### Fix
+
+- With `enforce_q_lims=True` a failed Q-limit pass is retried with the limits
+  from a DC start, and a solution violating the limits is reported as
+  `converged=False` (`converged_without_q_lims` / `infeasible_q_lims`)
+  instead of silently converged.
+
 ## v0.5.0 (2026-10-10)
 
 ### BREAKING CHANGE

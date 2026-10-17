@@ -67,6 +67,8 @@ def dc_powerflow(
     ref: np.ndarray,
     pv: np.ndarray,
     pq: np.ndarray,
+    *,
+    delta_ref: np.ndarray | None = None,
 ) -> np.ndarray:
     """Вычислить углы δ (рад) через DC-приближение.
 
@@ -77,9 +79,11 @@ def dc_powerflow(
         ref: индексы slack-шин (углы фиксированы = 0).
         pv: индексы PV.
         pq: индексы PQ.
+        delta_ref: ``(len(ref),)`` — fixed slack angles, rad. ``None`` — all
+            zero (the previous behavior).
 
     Returns:
-        ``(n_bus,)`` — углы δ в радианах. Slack-углы = 0.
+        ``(n_bus,)`` — углы δ в радианах; slack angles = ``delta_ref`` (or 0).
     """
     n_bus = net.n_bus
     pvpq = np.concatenate([pv, pq]).astype(np.int64)
@@ -90,6 +94,11 @@ def dc_powerflow(
     # Подматрица B' по pvpq строкам/столбцам.
     B_red = B[pvpq, :][:, pvpq]
     P_red = P_inj[pvpq]
+    shifted = delta_ref is not None and np.any(delta_ref != 0.0)
+    if shifted:
+        # Non-zero slack angles move to the right-hand side: B_rr·δ_r = P_r − B_rs·δ_s.
+        assert delta_ref is not None
+        P_red = P_red - B[pvpq, :][:, ref] @ delta_ref
 
     delta_red = spsolve(B_red, P_red)
     if not np.all(np.isfinite(delta_red)):
@@ -99,5 +108,5 @@ def dc_powerflow(
 
     delta = np.zeros(n_bus, dtype=np.float64)
     delta[pvpq] = delta_red
-    delta[ref] = 0.0
+    delta[ref] = delta_ref if shifted else 0.0
     return delta

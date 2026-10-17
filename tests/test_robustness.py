@@ -78,3 +78,21 @@ class TestDCWarmStart:
         assert delta[ref[0]] == 0.0  # slack δ = 0
         # Углы должны быть конечными.
         assert np.all(np.isfinite(delta))
+
+
+def test_dc_start_keeps_slack_set_angles() -> None:
+    """Two slack buses with set angles: the DC warm start anchors them."""
+    from gridpf._engine import _dc_start
+    from tests.conftest import _build_net
+
+    net = _build_net(
+        bus_type=[2, 0, 2],
+        edges=[(0, 1, 0.01, 0.1), (1, 2, 0.01, 0.1)],
+        p_inj=[0.0, -0.2, 0.0],
+        q_inj=[0.0, -0.1, 0.0],
+        bus_v_set=[1.0, np.nan, 1.0],
+        bus_va_set=[0.5, np.nan, 0.4],
+    )
+    V = _dc_start(net)
+    np.testing.assert_allclose(np.angle(V[[0, 2]]), [0.5, 0.4], atol=1e-12)
+    assert 0.3 < np.angle(V[1]) < 0.5

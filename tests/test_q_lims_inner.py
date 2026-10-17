@@ -258,3 +258,13 @@ class TestHonestStatus:
         res = solve(net, INNER)
         assert res.converged and res.q_lim_swaps >= 1 and res.q_violations == 0
         np.testing.assert_allclose(res.V, ref.V, atol=1e-7)
+
+
+class TestLooseTolerance:
+    def test_pinned_bus_within_q_residual_is_not_a_violation(
+        self, build_net: Callable[..., PFInput]
+    ) -> None:
+        net = _gen_net(build_net)
+        res = solve(net, PFOptions(enforce_q_lims=True, q_lim_mode="inner", tol_p=1e-3, tol_q=1e-3))
+        assert res.converged and res.q_violations == 0
+        assert res.q_lim_swaps >= 1
