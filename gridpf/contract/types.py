@@ -127,15 +127,50 @@ class PFInput:
     # bit-for-bit with the previous behavior. Since contract 2.1.0.
     bus_q_lock: np.ndarray | None = None
 
+    # Piecewise-polynomial load models (since contract 2.1.0), shared by buses.
+    # Model ``m`` owns segment rows ``load_model_seg_ptr[m]:load_model_seg_ptr[m+1]``
+    # (CSR pointer, ``(n_model+1,)`` int64). Each row has a lower voltage bound
+    # ``load_model_seg_v_lo`` (p.u. of nominal, strictly increasing within a
+    # model, the first one ≤ 0 — normally −inf) and coefficients
+    # ``load_model_seg_coef[:, 0..4]`` of ``c0 + c1·v + … + c4·v⁴`` normalised to
+    # the nominal load. Segment ``k`` is active for
+    # ``v_lo[k] < |V| ≤ v_lo[k+1]``: at a boundary the LOWER segment applies;
+    # the value and the Jacobian derivative come from the same segment.
+    # ``bus_p_load_model`` / ``bus_q_load_model`` (``(n_bus,)`` int32) pick the
+    # model of ``P_load`` / ``Q_load`` per bus; ``−1`` keeps the quadratic
+    # ``a``/``b`` coefficients (or the constant load). The critical voltage
+    # applies on top, as for the quadratic model. All ``None`` (default) —
+    # bit-for-bit with the previous behavior.
+    load_model_seg_ptr: np.ndarray | None = None
+    load_model_seg_v_lo: np.ndarray | None = None
+    load_model_seg_coef: np.ndarray | None = None
+    bus_p_load_model: np.ndarray | None = None
+    bus_q_load_model: np.ndarray | None = None
+
     base_mva: float = BASE_MVA
 
     @property
-    def has_voltage_dependent_load(self) -> bool:
+    def has_poly_load(self) -> bool:
         """Есть ли в сети хотя бы один узел с нетривиальной СХН (a1, a2, b1 или b2 ≠ 0)."""
         for arr in (self.bus_p_a1, self.bus_p_a2, self.bus_q_b1, self.bus_q_b2):
             if arr is not None and np.any(arr != 0.0):
                 return True
         return False
+
+    @property
+    def has_load_models(self) -> bool:
+        """Whether any bus uses a piecewise load model (index ≥ 0)."""
+        if self.load_model_seg_ptr is None:
+            return False
+        for arr in (self.bus_p_load_model, self.bus_q_load_model):
+            if arr is not None and np.any(np.asarray(arr) >= 0):
+                return True
+        return False
+
+    @property
+    def has_voltage_dependent_load(self) -> bool:
+        """Whether any bus load depends on ``|V|`` (quadratic or piecewise model)."""
+        return self.has_poly_load or self.has_load_models
 
 
 @dataclass

@@ -41,6 +41,71 @@ def _poly_eval(
     return result
 
 
+def _model_buses(net: PFInput, kind: str) -> tuple[np.ndarray, np.ndarray]:
+    """Buses using a piecewise load model for ``kind`` (``"p"``/``"q"``) and their model."""
+    idx = net.bus_p_load_model if kind == "p" else net.bus_q_load_model
+    if net.load_model_seg_ptr is None or idx is None:
+        empty = np.empty(0, dtype=np.int64)
+        return empty, empty
+    idx = np.asarray(idx, dtype=np.int64)
+    buses = np.nonzero(idx >= 0)[0]
+    return buses, idx[buses]
+
+
+def _segment_coef(net: PFInput, models: np.ndarray, vm: np.ndarray) -> np.ndarray:
+    """``(n, 5)`` coefficients of the active segment for each ``(model, |V|)``.
+
+    Segment ``k`` is active for ``v_lo[k] < |V| ≤ v_lo[k+1]`` (the lower one at
+    a boundary); ``|V|`` at or below the first bound uses the first segment.
+    """
+    assert net.load_model_seg_ptr is not None
+    assert net.load_model_seg_v_lo is not None and net.load_model_seg_coef is not None
+    ptr = np.asarray(net.load_model_seg_ptr, dtype=np.int64)
+    v_lo = np.asarray(net.load_model_seg_v_lo, dtype=np.float64)
+    coef = np.asarray(net.load_model_seg_coef, dtype=np.float64)
+    rows = np.empty(models.size, dtype=np.int64)
+    for m in np.unique(models).tolist():
+        sel = models == m
+        lo, hi = int(ptr[m]), int(ptr[m + 1])
+        seg = np.searchsorted(v_lo[lo:hi], vm[sel], side="left") - 1
+        rows[sel] = lo + np.maximum(seg, 0)
+    return coef[rows]
+
+
+def _apply_load_models(
+    net: PFInput, kind: str, load: np.ndarray | None, vm: np.ndarray, base: np.ndarray
+) -> np.ndarray:
+    """Replace ``base`` on model buses with ``load · (c0 + c1·v + … + c4·v⁴)`` at ``vm``.
+
+    The polynomial is summed in the order of :func:`_poly_eval`, so a model
+    carrying a former quadratic (``c3 = c4 = 0``) reproduces it bit-for-bit.
+    """
+    buses, models = _model_buses(net, kind)
+    if buses.size == 0 or load is None:
+        return base
+    v = vm[buses]
+    c = _segment_coef(net, models, v)
+    shape = c[:, 0] + c[:, 1] * v + c[:, 2] * v * v + c[:, 3] * v * v * v + c[:, 4] * v * v * v * v
+    out = np.array(base, dtype=np.float64, copy=True)
+    out[buses] = np.asarray(load, dtype=np.float64)[buses] * shape
+    return out
+
+
+def _apply_load_model_derivatives(
+    net: PFInput, kind: str, load: np.ndarray | None, vm: np.ndarray, base: np.ndarray
+) -> np.ndarray:
+    """Replace ``base`` on model buses with ``load · (c1 + 2c2·v + 3c3·v² + 4c4·v³)``."""
+    buses, models = _model_buses(net, kind)
+    if buses.size == 0 or load is None:
+        return base
+    v = vm[buses]
+    c = _segment_coef(net, models, v)
+    slope = c[:, 1] + 2.0 * c[:, 2] * v + 3.0 * c[:, 3] * v * v + 4.0 * c[:, 4] * v * v * v
+    out = np.array(base, dtype=np.float64, copy=True)
+    out[buses] = np.asarray(load, dtype=np.float64)[buses] * slope
+    return out
+
+
 def _critical_effective_vm(
     Vm: np.ndarray,
     v_critical: np.ndarray | None,
@@ -97,6 +162,7 @@ def q_load_at(
         q_v = q_load
     else:
         q_v = _poly_eval(q_load, b0, b1, b2, vm_eff)
+    q_v = _apply_load_models(net, "q", q_load, vm_eff, q_v)
     if scale is not None:
         q_v = q_v * scale
     return q_v
@@ -143,9 +209,10 @@ def compute_sbus(
     Returns:
         ``Sbus`` длиной ``n_bus``, dtype=complex128.
     """
-    has_poly = net.has_voltage_dependent_load
+    has_poly = net.has_poly_load
+    has_models = net.has_load_models
     has_crit = net.bus_v_critical is not None
-    if not voltage_dependent or not (has_poly or has_crit):
+    if not voltage_dependent or not (has_poly or has_models or has_crit):
         return build_sbus(net)
 
     Vm = np.abs(V)
@@ -170,6 +237,9 @@ def compute_sbus(
         # ради const-Z продолжения ниже крита.
         p_load_v = np.asarray(p_load, dtype=np.float64)
         q_load_v = np.asarray(q_load, dtype=np.float64)
+    if has_models:
+        p_load_v = _apply_load_models(net, "p", p_load, vm_eff, p_load_v)
+        q_load_v = _apply_load_models(net, "q", q_load, vm_eff, q_load_v)
     if scale is not None:
         p_load_v = p_load_v * scale
         q_load_v = q_load_v * scale
@@ -219,6 +289,8 @@ def load_voltage_derivatives(
         dQ = np.zeros(n, dtype=np.float64)
     else:
         dQ = _poly_eval(q_load, b1, 2.0 * b2, 0.0, Vm)
+    dP = _apply_load_model_derivatives(net, "p", p_load, Vm, dP)
+    dQ = _apply_load_model_derivatives(net, "q", q_load, Vm, dQ)
 
     if has_crit:
         # Ниже крита S_load = S_load(V_crit)·(|V|/V_crit)² →
@@ -235,6 +307,7 @@ def load_voltage_derivatives(
                     if a0 is not None and a1 is not None and a2 is not None
                     else np.asarray(p_load, np.float64)
                 )
+                p_at_crit = _apply_load_models(net, "p", p_load, safe_crit, p_at_crit)
                 dP = np.where(below, p_at_crit * 2.0 * Vm / (safe_crit * safe_crit), dP)
             b0 = net.bus_q_b0
             if q_load is not None:
@@ -243,6 +316,7 @@ def load_voltage_derivatives(
                     if b0 is not None and b1 is not None and b2 is not None
                     else np.asarray(q_load, np.float64)
                 )
+                q_at_crit = _apply_load_models(net, "q", q_load, safe_crit, q_at_crit)
                 dQ = np.where(below, q_at_crit * 2.0 * Vm / (safe_crit * safe_crit), dQ)
     return dP, dQ
 
