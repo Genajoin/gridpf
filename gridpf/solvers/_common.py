@@ -49,7 +49,7 @@ def resolve_use_load(net: PFInput | None, voltage_dependent_load: bool) -> bool:
     """Return whether voltage-dependent load handling is active for this run.
 
     True when the polynomial load model is present, or when the network
-    carries ``bus_v_critical`` (Rastr U_krit semantics: constant-impedance
+    carries ``bus_v_critical`` (critical-voltage semantics: constant-impedance
     continuation below the critical voltage makes even constant loads
     voltage-dependent, so Sbus must be recomputed per iteration and the
     Jacobian must carry the load derivative).

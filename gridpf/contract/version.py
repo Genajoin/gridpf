@@ -32,7 +32,9 @@ from dataclasses import dataclass
 # контракта. Бамп — по политике выше; синхронно обновлять при изменении
 # :mod:`gridpf.contract.types`.
 # 2.0.0: meaning of branch_g_from/branch_b_from changed (see algebra.ybus).
-CONTRACT_VERSION = "2.0.0"
+# 2.1.0: optional bus_q_lock (initial Q-limit state of PV buses) and
+#        piecewise-polynomial load models (load_model_seg_*, bus_*_load_model).
+CONTRACT_VERSION = "2.1.0"
 
 # Ключ, под которым версия контракта кладётся в метаданные сериализованных
 # данных. Валидатор читает его на входе.

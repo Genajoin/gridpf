@@ -19,7 +19,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -275,3 +275,221 @@ def enforce_q_limits(
         changed=len(actions) > 0,
         bus_q_gen_new=bus_q_gen_new,
     )
+
+
+# Inner-mode per-step check on buses pinned at a Q limit: relative deviation
+# of |V| from V_set in the "wrong" direction (above V_set at Qmax, below at
+# Qmin) that returns the bus to PV after an ordinary Newton step.
+_STEP_RETURN_NEW_LOCK = 1e-2  # only for buses pinned during this run
+_STEP_RETURN_ANY = 5e-2
+_STEP_RETURN_UNDO = 1e-1  # also undoes the step that produced the deviation
+
+
+def apply_initial_locks(
+    pv: np.ndarray,
+    pq: np.ndarray,
+    Sbus: np.ndarray,
+    net: PFInput,
+    V: np.ndarray,
+    q_min: np.ndarray,
+    q_max: np.ndarray,
+    lock: np.ndarray,
+    *,
+    voltage_dependent_load: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, PFInput]:
+    """Start PV buses flagged by ``bus_q_lock`` as PQ pinned at their limit.
+
+    Returns ``(pv, pq, Sbus, locked_lim, net)`` with the same bookkeeping as a
+    PV→PQ swap of :func:`enforce_q_limits`: ``Q_gen`` is fixed at the limit
+    (``net.bus_q_gen`` when present, ``Sbus`` otherwise) and ``|V|`` is free.
+    """
+    n = Sbus.size
+    locked_lim = np.full(n, np.nan, dtype=np.float64)
+    pv_set = set(pv.tolist())
+    # Defensive: a lock without a finite limit on its side is ignored (strict
+    # validation rejects it; adapters may call with validate=False).
+    targets = [
+        k
+        for k in np.nonzero(lock)[0].tolist()
+        if k in pv_set and np.isfinite(q_max[k] if lock[k] > 0 else q_min[k])
+    ]
+    if not targets:
+        return pv, pq, Sbus, locked_lim, net
+    Sbus_new = Sbus.copy()
+    q_load = q_load_at(net, V, voltage_dependent=voltage_dependent_load)
+    q_gen_new = net.bus_q_gen.copy() if net.bus_q_gen is not None else None
+    for k in targets:
+        qlim = float(q_max[k] if lock[k] > 0 else q_min[k])
+        Sbus_new[k] = Sbus_new[k].real + 1j * (qlim - float(q_load[k]))
+        if q_gen_new is not None:
+            q_gen_new[k] = qlim
+        locked_lim[k] = qlim
+        pv_set.discard(k)
+    net_new = replace(net, bus_q_gen=q_gen_new) if q_gen_new is not None else net
+    pv_new = np.array(sorted(pv_set), dtype=np.int64)
+    pq_new = np.array(sorted(set(pq.tolist()) | set(targets)), dtype=np.int64)
+    return pv_new, pq_new, Sbus_new, locked_lim, net_new
+
+
+class InnerQLimits:
+    """Q-limit switching inside the Newton iteration (``q_lim_mode="inner"``).
+
+    State per bus: ``side`` (−1 pinned at Qmin, 0 free PV, +1 pinned at Qmax),
+    the number of returns to PV per direction, and whether the bus was pinned
+    during this run. :func:`gridpf.solvers.newton_raphson.newton_raphson`
+    calls two hooks:
+
+    * :meth:`step_check` after every ordinary step — returns pinned buses whose
+      ``|V|`` drifted too far in the wrong direction (and may ask to undo the
+      step);
+    * :meth:`convergence_switch` when the residual is within tolerance —
+      applies one direction group at a fixed priority: group 1
+      {PV→Qmax, Qmin→PV}, and only when it is empty group 2 {PV→Qmin,
+      Qmax→PV}. All candidates of the group switch at once.
+
+    Returns to PV are capped at ``max_returns`` per bus and direction; after
+    that the bus stays pinned. A returned bus gets ``|V| = V_set`` (the angle
+    is kept) — the caller applies it via :attr:`v_set`.
+    """
+
+    def __init__(
+        self,
+        Ybus: csr_matrix,
+        *,
+        pv: np.ndarray,
+        pq: np.ndarray,
+        Sbus: np.ndarray,
+        net: PFInput,
+        q_min: np.ndarray,
+        q_max: np.ndarray,
+        v_set: np.ndarray,
+        side: np.ndarray,
+        pv_original: np.ndarray,
+        q_lim_tol: float,
+        v_deadband_rel: float,
+        max_returns: int,
+        voltage_dependent_load: bool,
+    ) -> None:
+        n = Sbus.size
+        self._Ybus = Ybus
+        self.pv = pv
+        self.pq = pq
+        self.Sbus = Sbus.copy()
+        self.net = net
+        self.v_set = v_set
+        self.side = np.asarray(side, dtype=np.int8).copy()
+        self.actions: list[QLimAction] = []
+        self._q_min = q_min
+        self._q_max = q_max
+        self._is_pv_original = np.zeros(n, dtype=bool)
+        self._is_pv_original[pv_original] = True
+        self._pq_base = np.setdiff1d(pq, np.nonzero(self.side)[0])
+        self._hit = np.zeros(n, dtype=bool)
+        self._returns = np.zeros((n, 2), dtype=np.int64)  # [:, 0] from Qmin, [:, 1] from Qmax
+        self._tol = q_lim_tol
+        self._deadband = v_deadband_rel
+        self._max_returns = max_returns
+        self._use_load = voltage_dependent_load
+
+    @property
+    def locked_lim(self) -> np.ndarray:
+        """Per-bus pinned ``Q`` value (NaN for free buses), as in the outer loop."""
+        out = np.full(self.side.size, np.nan, dtype=np.float64)
+        out[self.side > 0] = self._q_max[self.side > 0]
+        out[self.side < 0] = self._q_min[self.side < 0]
+        return out
+
+    def _dv(self, V: np.ndarray) -> np.ndarray:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.asarray((np.abs(V) - self.v_set) / self.v_set)
+
+    def _can_return(self) -> np.ndarray:
+        col = np.where(self.side > 0, 1, 0)
+        left = self._returns[np.arange(self.side.size), col] < self._max_returns
+        return np.asarray((self.side != 0) & left & ~np.isnan(self.v_set))
+
+    def _q_gen(self, V: np.ndarray) -> np.ndarray:
+        S_calc = V * np.conj(self._Ybus @ V)
+        q_load = q_load_at(self.net, V, voltage_dependent=self._use_load)
+        return np.asarray(S_calc.imag + q_load)
+
+    def _rebuild(self) -> None:
+        free = self._is_pv_original & (self.side == 0)
+        self.pv = np.nonzero(free)[0].astype(np.int64)
+        locked = np.nonzero(self.side != 0)[0]
+        self.pq = np.union1d(self._pq_base, locked).astype(np.int64)
+
+    def _pin(self, buses: np.ndarray, side: int, V: np.ndarray) -> None:
+        q_load = q_load_at(self.net, V, voltage_dependent=self._use_load)
+        q_gen_new = self.net.bus_q_gen.copy() if self.net.bus_q_gen is not None else None
+        for k in buses.tolist():
+            qlim = float(self._q_max[k] if side > 0 else self._q_min[k])
+            self.Sbus[k] = self.Sbus[k].real + 1j * (qlim - float(q_load[k]))
+            if q_gen_new is not None:
+                q_gen_new[k] = qlim
+            self.side[k] = side
+            self._hit[k] = True
+            direction = "pv->pq_qmax" if side > 0 else "pv->pq_qmin"
+            self.actions.append(QLimAction(bus_idx=k, direction=direction, q_value=qlim))
+        if q_gen_new is not None:
+            self.net = replace(self.net, bus_q_gen=q_gen_new)
+
+    def _release(self, buses: np.ndarray, V: np.ndarray) -> None:
+        vm = np.abs(V)
+        for k in buses.tolist():
+            from_max = self.side[k] > 0
+            self._returns[k, 1 if from_max else 0] += 1
+            self.side[k] = 0
+            direction = "pq->pv_qmax" if from_max else "pq->pv_qmin"
+            self.actions.append(QLimAction(bus_idx=k, direction=direction, q_value=float(vm[k])))
+
+    def step_check(self, V: np.ndarray) -> tuple[np.ndarray, bool]:
+        """Return pinned buses drifting the wrong way after an ordinary step.
+
+        Returns ``(released, undo)``; the released buses are already free PV
+        in :attr:`pv` / :attr:`pq`. ``undo`` asks the caller to roll the step
+        back before setting ``|V| = V_set`` on them.
+        """
+        eligible = self._can_return()
+        if not eligible.any():
+            return np.empty(0, dtype=np.int64), False
+        wrong = self.side * self._dv(V)
+        release = eligible & (
+            (self._hit & (wrong > _STEP_RETURN_NEW_LOCK)) | (wrong > _STEP_RETURN_ANY)
+        )
+        if not release.any():
+            return np.empty(0, dtype=np.int64), False
+        undo = bool(np.any(release & (wrong > _STEP_RETURN_UNDO)))
+        buses = np.nonzero(release)[0].astype(np.int64)
+        self._release(buses, V)
+        self._rebuild()
+        return buses, undo
+
+    def convergence_switch(self, V: np.ndarray) -> tuple[bool, np.ndarray]:
+        """Apply one direction group at a converged point.
+
+        Returns ``(changed, released)`` — ``released`` are buses returned to
+        PV (the caller sets their ``|V| = V_set``).
+        """
+        pv = self.pv
+        q_gen = self._q_gen(V)
+        dv = self._dv(V)
+        can_return = self._can_return()
+        qmx = self._q_max[pv]
+        qmn = self._q_min[pv]
+        over = pv[~np.isnan(qmx) & (q_gen[pv] > qmx + self._tol)]
+        under = pv[~np.isnan(qmn) & (q_gen[pv] < qmn - self._tol)]
+        under = np.setdiff1d(under, over)
+        back_from_min = np.nonzero(can_return & (self.side < 0) & (dv < -self._deadband))[0]
+        back_from_max = np.nonzero(can_return & (self.side > 0) & (dv > self._deadband))[0]
+
+        if over.size or back_from_min.size:
+            pin, side, release = over, 1, back_from_min
+        elif under.size or back_from_max.size:
+            pin, side, release = under, -1, back_from_max
+        else:
+            return False, np.empty(0, dtype=np.int64)
+        self._release(release, V)
+        self._pin(pin, side, V)
+        self._rebuild()
+        return True, release.astype(np.int64)

@@ -32,6 +32,8 @@ SLACK: int = 2
 
 
 Method = Literal["gs+nr", "nr", "gs"]
+QLimMode = Literal["outer", "inner"]
+GSMode = Literal["classic", "ordered"]
 
 
 @dataclass
@@ -108,7 +110,7 @@ class PFInput:
     bus_v_set: np.ndarray | None = None
     bus_va_set: np.ndarray | None = None
 
-    # Критическое напряжение нагрузки (p.u., Rastr U_krit semantics). Ниже
+    # Критическое напряжение нагрузки (p.u.). Ниже
     # ``bus_v_critical[i]`` нагрузка узла продолжается как const-Z:
     #   S_load(|V|) = S_load(V_crit) · (|V| / V_crit)²
     # — полином СХН (или константная нагрузка) вычисляется в точке V_crit и
@@ -119,15 +121,57 @@ class PFInput:
     # адаптером (типовое значение Растра — 0.7·Vnom → 0.7 p.u.).
     bus_v_critical: np.ndarray | None = None
 
+    # Initial Q-limit state of PV buses (int8): −1 — the generator starts
+    # pinned at Q_min, +1 — at Q_max (the bus starts as PQ with free |V| and
+    # may return to PV under the Q-limit rules), 0 — free. Only honoured with
+    # ``PFOptions.enforce_q_lims=True``. ``None`` (default) — all free,
+    # bit-for-bit with the previous behavior. Since contract 2.1.0.
+    bus_q_lock: np.ndarray | None = None
+
+    # Piecewise-polynomial load models (since contract 2.1.0), shared by buses.
+    # Model ``m`` owns segment rows ``load_model_seg_ptr[m]:load_model_seg_ptr[m+1]``
+    # (CSR pointer, ``(n_model+1,)`` int64). Each row has a lower voltage bound
+    # ``load_model_seg_v_lo`` (p.u. of nominal, strictly increasing within a
+    # model, the first one ≤ 0 — normally −inf) and coefficients
+    # ``load_model_seg_coef[:, 0..4]`` of ``c0 + c1·v + … + c4·v⁴`` normalised to
+    # the nominal load. Segment ``k`` is active for
+    # ``v_lo[k] < |V| ≤ v_lo[k+1]``: at a boundary the LOWER segment applies;
+    # the value and the Jacobian derivative come from the same segment.
+    # ``bus_p_load_model`` / ``bus_q_load_model`` (``(n_bus,)`` int32) pick the
+    # model of ``P_load`` / ``Q_load`` per bus; ``−1`` keeps the quadratic
+    # ``a``/``b`` coefficients (or the constant load). The critical voltage
+    # applies on top, as for the quadratic model. All ``None`` (default) —
+    # bit-for-bit with the previous behavior.
+    load_model_seg_ptr: np.ndarray | None = None
+    load_model_seg_v_lo: np.ndarray | None = None
+    load_model_seg_coef: np.ndarray | None = None
+    bus_p_load_model: np.ndarray | None = None
+    bus_q_load_model: np.ndarray | None = None
+
     base_mva: float = BASE_MVA
 
     @property
-    def has_voltage_dependent_load(self) -> bool:
+    def has_poly_load(self) -> bool:
         """Есть ли в сети хотя бы один узел с нетривиальной СХН (a1, a2, b1 или b2 ≠ 0)."""
         for arr in (self.bus_p_a1, self.bus_p_a2, self.bus_q_b1, self.bus_q_b2):
             if arr is not None and np.any(arr != 0.0):
                 return True
         return False
+
+    @property
+    def has_load_models(self) -> bool:
+        """Whether any bus uses a piecewise load model (index ≥ 0)."""
+        if self.load_model_seg_ptr is None:
+            return False
+        for arr in (self.bus_p_load_model, self.bus_q_load_model):
+            if arr is not None and np.any(np.asarray(arr) >= 0):
+                return True
+        return False
+
+    @property
+    def has_voltage_dependent_load(self) -> bool:
+        """Whether any bus load depends on ``|V|`` (quadratic or piecewise model)."""
+        return self.has_poly_load or self.has_load_models
 
 
 @dataclass
@@ -142,6 +186,12 @@ class PFOptions:
             ``"nr"`` — только Newton-Raphson из flat-старта; ``"gs"`` — только
             Gauss-Seidel.
         tol: целевая ∞-норма мощностного небаланса (p.u.).
+        tol_p, tol_q: separate Newton tolerances (p.u.) on the active and the
+            reactive residual: converged when ``max|ΔP| < tol_p`` and
+            ``max|ΔQ| < tol_q``. ``None`` falls back to ``tol``; both ``None``
+            (default) — a single ``tol`` on the whole residual, bit-for-bit.
+            They also gate the Q-limit check of ``q_lim_mode="inner"``. The
+            Gauss-Seidel phase keeps ``tol`` / ``gs_tol``.
         max_iter_gs: максимум итераций Gauss-Seidel (в ``"gs+nr"`` — короткий
             warm-start).
         max_iter_nr: максимум итераций Newton-Raphson.
@@ -171,10 +221,59 @@ class PFOptions:
             ``failure_reason="implausible_voltage"``. Диапазон намеренно
             экстремальный (легитимные тяжёлые режимы не задевает);
             ``None`` — проверка выключена (прежнее поведение).
+        step_max_dvm: Newton step scaling on the voltage modulus — the whole
+            increment is scaled so that ``|Δ|V|| / |V|²`` (relative step
+            divided by ``|V|`` in p.u.) stays within the limit. ``None`` — off.
+        step_max_dva: Newton step scaling on the per-bus angle step, rad.
+        step_max_branch_dva: Newton step scaling on the per-branch
+            angle-difference step ``|Δδ_i − Δδ_j|``, rad.
+        step_v_corridor: ``(v_lo, v_hi)`` p.u. — post-step corridor: a bus
+            crossing its boundary rolls the whole step back onto it
+            (from the second Newton iteration on).
+        step_max_branch_angle: post-step corridor on ``|δ_i − δ_j|`` over
+            branches, rad.
+
+        q_lim_mode: where Q limits are checked (with ``enforce_q_lims=True``).
+            ``"outer"`` (default) — outer loop after a fully converged Newton
+            pass, ``q_lim_top_k`` worst violators per pass, PQ→PV only with
+            ``allow_pq_to_pv``. ``"inner"`` — inside the Newton iteration:
+            whenever the residual is within ``tol`` one direction group
+            switches at a fixed priority (PV→Qmax with Qmin→PV first, then
+            PV→Qmin with Qmax→PV), all its candidates at once; pinned buses
+            drifting from ``V_set`` in the wrong direction are also returned
+            to PV after ordinary steps. ``q_lim_top_k`` and ``allow_pq_to_pv``
+            are ignored in this mode; ``q_lim_tol`` is the Q deadband.
+        q_lim_v_deadband: ``"inner"`` mode — relative ``|V|`` deadband of the
+            PQ→PV return at a converged point: a bus pinned at Qmax returns
+            when ``(|V| − V_set)/V_set > deadband`` (symmetrically at Qmin).
+        q_lim_max_returns: ``"inner"`` mode — returns to PV allowed per bus
+            and direction; after that the bus stays pinned.
+
+        gs_mode: Gauss-Seidel warm start. ``"classic"`` (default) — buses in
+            index order, constant-power load, up to ``max_iter_gs`` iterations
+            down to ``gs_tol``. ``"ordered"`` — exactly ``max_iter_gs`` passes
+            in the order of the referred series impedance from the slack,
+            loads with ``P > 0, Q > 0`` taken as admittances at the current
+            ``|V|`` (see :mod:`gridpf.solvers.gauss_seidel_ordered`).
+        gs_min_x: ``"ordered"`` mode — scale of the small inductive reactance
+            that replaces a series-capacitive branch (``x < 0``) during
+            Gauss-Seidel: ``x_eq = 55·gs_min_x·U_from`` Ω, ``U_from`` — nominal
+            voltage of the branch "from" bus in kV (``4e-6`` → ``2.2e-4·U`` Ω).
+        gs_guard: discard the Gauss-Seidel result and start Newton from the
+            pre-GS voltage when GS made the residual worse, produced a
+            non-finite value or left ``step_v_corridor``. ``False`` — off.
+        init_v_max_mismatch: with a warm start ``init_v``, fall back to the
+            flat start when the residual at ``init_v`` exceeds this value
+            (p.u.). ``None`` — off.
+
+        All ``step_*`` limits default to ``None`` (bit-for-bit with the
+        unlimited step); see :mod:`gridpf.solvers.step_limits`.
     """
 
     method: Method = "gs+nr"
     tol: float = 1e-8
+    tol_p: float | None = None
+    tol_q: float | None = None
     max_iter_gs: int = 10
     max_iter_nr: int = 30
     gs_tol: float = 1e-2
@@ -186,6 +285,18 @@ class PFOptions:
     dc_fallback: bool = True
     use_load_voltage_dependency: bool = True
     v_plausible_range: tuple[float, float] | None = (0.5, 1.5)
+    step_max_dvm: float | None = None
+    step_max_dva: float | None = None
+    step_max_branch_dva: float | None = None
+    step_v_corridor: tuple[float, float] | None = None
+    step_max_branch_angle: float | None = None
+    q_lim_mode: QLimMode = "outer"
+    q_lim_v_deadband: float = 1e-5
+    q_lim_max_returns: int = 4
+    gs_mode: GSMode = "classic"
+    gs_min_x: float = 4e-6
+    gs_guard: bool = False
+    init_v_max_mismatch: float | None = None
 
 
 @dataclass
@@ -220,7 +331,12 @@ class PFResult:
     failure_reason: str = ""
     """Если ``converged=False`` — короткий код причины: ``max_iter_reached``,
     ``singular_jacobian``, ``no_slack_component``, ``voltage_collapse``,
-    ``infeasible_q_lims``, ``implausible_voltage``. Пустая строка при успехе."""
+    ``infeasible_q_lims``, ``implausible_voltage``, ``converged_without_q_lims``.
+    Пустая строка при успехе. With ``enforce_q_lims=True`` a solution that
+    violates the generator Q limits is never ``converged``: ``infeasible_q_lims``
+    when the Q-limit pass ended with violations, ``converged_without_q_lims``
+    when only the fallback without Q limits solved it (``V`` is that solution,
+    ``q_violations`` counts its violations)."""
     implausible_v_nodes: int = 0
     """Узлов с ``|V|`` вне ``v_plausible_range`` в численно сошедшемся решении
     (>0 ⇒ ``converged=False``, ``failure_reason="implausible_voltage"``)."""
