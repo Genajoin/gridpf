@@ -33,6 +33,13 @@ from gridpf.solvers._common import (
     residual_vector,
     resolve_use_load,
 )
+from gridpf.solvers.step_limits import (
+    StepLimits,
+    branch_pairs,
+    corridor_correction,
+    expand_increment,
+    step_scale,
+)
 
 
 if TYPE_CHECKING:
@@ -97,6 +104,7 @@ def newton_raphson(
     step_control: bool = True,
     net: PFInput | None = None,
     voltage_dependent_load: bool = False,
+    step_limits: StepLimits | None = None,
 ) -> NRResult:
     """Прогнать Newton-Raphson до сходимости или ``max_iter``.
 
@@ -119,6 +127,9 @@ def newton_raphson(
             для пересчёта Sbus и поправки якобиана от СХН.
         voltage_dependent_load: учитывать СХН (полиномиальную зависимость
             нагрузки от ``|V|``). По умолчанию ``False`` для backward compat.
+        step_limits: step-size limits and the post-step corridor (see
+            :mod:`gridpf.solvers.step_limits`). ``None`` or all-``None``
+            limits — unlimited step, bit-for-bit with the previous behavior.
 
     Returns:
         ``NRResult`` с финальным напряжением, флагом сходимости, числом
@@ -142,9 +153,13 @@ def newton_raphson(
     if norm_f < tol or max_iter == 0:
         return NRResult(V=V, converged=norm_f < tol, iterations=0, mismatch_max=norm_f)
 
+    scaling = step_limits is not None and step_limits.scaling_active
+    corridor = step_limits is not None and step_limits.corridor_active
+    pairs = branch_pairs(Ybus) if step_limits is not None and step_limits.needs_branches else None
+
     iteration = 0
     converged = False
-    for iteration in range(1, max_iter + 1):  # noqa: B007 — счётчик нужен в return
+    for iteration in range(1, max_iter + 1):
         if use_load:
             assert net is not None
             dP_load, dQ_load = load_voltage_derivatives(net, V)
@@ -170,13 +185,19 @@ def newton_raphson(
             norm_f = float("nan")
             break
 
-        # Полный шаг μ=1 пробуем всегда; backtracking активен только если
-        # норма выросла И step_control=True.
+        # Полный шаг μ=1 пробуем всегда (или μ=α при ограничении шага);
+        # backtracking активен только если норма выросла И step_control=True.
+        mu0 = 1.0
+        if scaling:
+            assert step_limits is not None
+            dva, dvm = expand_increment(dx, V.size, pv, pq)
+            mu0 = step_scale(Vm, dva, dvm, step_limits, pairs)
+        mu_try = mu0
         Vm_try, Va_try, V_try, f_try, norm_try = _try_step(
-            Ybus, Vm, Va, dx, 1.0, pv, pq, Sbus, net, use_load
+            Ybus, Vm, Va, dx, mu0, pv, pq, Sbus, net, use_load
         )
         if step_control and norm_try > norm_f:
-            mu = 0.5
+            mu = 0.5 * mu0
             descent = False
             for _bt in range(5):
                 Vm_bt, Va_bt, V_bt, f_bt, norm_bt = _try_step(
@@ -184,6 +205,7 @@ def newton_raphson(
                 )
                 if norm_bt < norm_try:
                     Vm_try, Va_try, V_try, f_try, norm_try = (Vm_bt, Va_bt, V_bt, f_bt, norm_bt)
+                    mu_try = mu
                 if norm_bt < norm_f:
                     descent = True
                     break
@@ -194,6 +216,16 @@ def newton_raphson(
                 # детерминированный неуспех из лучшей точки, здоровее DC-fallback.
                 converged = False
                 break
+
+        if corridor and iteration > 1:
+            # Post-step corridor: roll the whole applied step back so that the
+            # worst outward violator lands on the boundary (no-op on iteration 1).
+            assert step_limits is not None
+            a = corridor_correction(Vm, Va, Vm_try, Va_try, step_limits, pairs)
+            if a < 0.0:
+                Vm_try, Va_try, V_try, f_try, norm_try = _try_step(
+                    Ybus, Vm, Va, dx, mu_try * (1.0 + a), pv, pq, Sbus, net, use_load
+                )
 
         Vm, Va, V, f_vec, norm_f = Vm_try, Va_try, V_try, f_try, norm_try
 

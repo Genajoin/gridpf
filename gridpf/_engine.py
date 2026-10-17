@@ -30,6 +30,7 @@ from gridpf.solvers.dc_pf import dc_powerflow
 from gridpf.solvers.gauss_seidel import gauss_seidel
 from gridpf.solvers.newton_raphson import NRResult, newton_raphson
 from gridpf.solvers.q_lims import enforce_q_limits, q_limit_violations
+from gridpf.solvers.step_limits import StepLimits
 
 
 if TYPE_CHECKING:
@@ -140,6 +141,17 @@ class _Classification:
         self.net = snap.net
 
 
+def _step_limits(options: PFOptions) -> StepLimits:
+    """Newton step limits taken from the engine options."""
+    return StepLimits(
+        max_dvm=options.step_max_dvm,
+        max_dva=options.step_max_dva,
+        max_branch_dva=options.step_max_branch_dva,
+        v_corridor=options.step_v_corridor,
+        max_branch_angle=options.step_max_branch_angle,
+    )
+
+
 def _run_nr(
     state: _NRState,
     cls: _Classification,
@@ -162,6 +174,7 @@ def _run_nr(
             max_iter=options.max_iter_nr,
             net=cls.net,
             voltage_dependent_load=use_load,
+            step_limits=_step_limits(options),
         )
     )
 
@@ -313,6 +326,7 @@ def _soft_fallback(
         max_iter=options.max_iter_nr,
         net=net_orig,
         voltage_dependent_load=use_load,
+        step_limits=_step_limits(options),
     )
     if nr_fb.converged:
         state.absorb(nr_fb)
@@ -355,6 +369,7 @@ def _dc_fallback(
         max_iter=options.max_iter_nr,
         net=cls.net,
         voltage_dependent_load=use_load,
+        step_limits=_step_limits(options),
     )
     if nr_dc.converged:
         state.absorb(nr_dc)

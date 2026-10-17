@@ -171,6 +171,20 @@ class PFOptions:
             ``failure_reason="implausible_voltage"``. Диапазон намеренно
             экстремальный (легитимные тяжёлые режимы не задевает);
             ``None`` — проверка выключена (прежнее поведение).
+        step_max_dvm: Newton step scaling on the voltage modulus — the whole
+            increment is scaled so that ``|Δ|V|| / |V|²`` (relative step
+            divided by ``|V|`` in p.u.) stays within the limit. ``None`` — off.
+        step_max_dva: Newton step scaling on the per-bus angle step, rad.
+        step_max_branch_dva: Newton step scaling on the per-branch
+            angle-difference step ``|Δδ_i − Δδ_j|``, rad.
+        step_v_corridor: ``(v_lo, v_hi)`` p.u. — post-step corridor: a bus
+            leaving it outward rolls the whole step back onto the boundary
+            (from the second Newton iteration on).
+        step_max_branch_angle: post-step corridor on ``|δ_i − δ_j|`` over
+            branches, rad.
+
+        All ``step_*`` limits default to ``None`` (bit-for-bit with the
+        unlimited step); see :mod:`gridpf.solvers.step_limits`.
     """
 
     method: Method = "gs+nr"
@@ -186,6 +200,11 @@ class PFOptions:
     dc_fallback: bool = True
     use_load_voltage_dependency: bool = True
     v_plausible_range: tuple[float, float] | None = (0.5, 1.5)
+    step_max_dvm: float | None = None
+    step_max_dva: float | None = None
+    step_max_branch_dva: float | None = None
+    step_v_corridor: tuple[float, float] | None = None
+    step_max_branch_angle: float | None = None
 
 
 @dataclass
