@@ -1,4 +1,4 @@
-"""Tests for the Rastr U_krit semantics (``PFInput.bus_v_critical``).
+"""Tests for the critical-voltage load semantics (``PFInput.bus_v_critical``).
 
 Below the per-bus critical voltage the load continues as constant impedance:
 ``S_load(|V|) = S_load(V_crit) · (|V|/V_crit)²`` — for both polynomial (ZIP)

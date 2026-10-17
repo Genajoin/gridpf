@@ -108,7 +108,7 @@ class PFInput:
     bus_v_set: np.ndarray | None = None
     bus_va_set: np.ndarray | None = None
 
-    # Критическое напряжение нагрузки (p.u., Rastr U_krit semantics). Ниже
+    # Критическое напряжение нагрузки (p.u.). Ниже
     # ``bus_v_critical[i]`` нагрузка узла продолжается как const-Z:
     #   S_load(|V|) = S_load(V_crit) · (|V| / V_crit)²
     # — полином СХН (или константная нагрузка) вычисляется в точке V_crit и

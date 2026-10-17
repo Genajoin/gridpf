@@ -45,7 +45,7 @@ def _critical_effective_vm(
     Vm: np.ndarray,
     v_critical: np.ndarray | None,
 ) -> tuple[np.ndarray, np.ndarray | None]:
-    """Rastr U_krit semantics: freeze the load-shape voltage at ``V_crit``.
+    """Critical-voltage semantics: freeze the load-shape voltage at ``V_crit``.
 
     Below the per-bus critical voltage the load continues as constant
     impedance: the polynomial (or constant) model is evaluated at ``V_crit``
