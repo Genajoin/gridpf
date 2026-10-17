@@ -112,6 +112,33 @@ def validate_input(net: PFInput, *, strict: bool = False) -> ValidationReport:
     if not (0 <= net.slack_idx < net.n_bus):
         report.issues.append(ValidationIssue("slack_idx", f"вне диапазона [0, {net.n_bus - 1}]"))
 
+    _check_q_lock(net, report)
+
     if strict:
         report.raise_if_invalid()
     return report
+
+
+def _check_q_lock(net: PFInput, report: ValidationReport) -> None:
+    """``bus_q_lock``: values in {−1, 0, +1}, only on PV buses with that limit set."""
+    lock = net.bus_q_lock
+    if lock is None:
+        return
+    lock = np.asarray(lock)
+    if lock.shape != (net.n_bus,):
+        report.issues.append(ValidationIssue("bus_q_lock", f"shape {lock.shape} != ({net.n_bus},)"))
+        return
+    if not np.isin(lock, (-1, 0, 1)).all():
+        report.issues.append(ValidationIssue("bus_q_lock", "values must be -1, 0 or +1"))
+        return
+    locked = lock != 0
+    if np.any(locked & (np.asarray(net.bus_type) != 1)):
+        report.issues.append(ValidationIssue("bus_q_lock", "non-zero lock on a non-PV bus"))
+    for side, name, lim in ((1, "bus_q_max", net.bus_q_max), (-1, "bus_q_min", net.bus_q_min)):
+        on_side = lock == side
+        if not on_side.any():
+            continue
+        if lim is None or not np.all(np.isfinite(np.asarray(lim)[on_side])):
+            report.issues.append(
+                ValidationIssue("bus_q_lock", f"lock {side:+d} requires a finite {name}")
+            )

@@ -29,7 +29,12 @@ from gridpf.solvers._common import resolve_use_load
 from gridpf.solvers.dc_pf import dc_powerflow
 from gridpf.solvers.gauss_seidel import gauss_seidel
 from gridpf.solvers.newton_raphson import NRResult, newton_raphson
-from gridpf.solvers.q_lims import enforce_q_limits, q_limit_violations
+from gridpf.solvers.q_lims import (
+    InnerQLimits,
+    apply_initial_locks,
+    enforce_q_limits,
+    q_limit_violations,
+)
 from gridpf.solvers.step_limits import StepLimits
 
 
@@ -160,6 +165,7 @@ def _run_nr(
     *,
     options: PFOptions,
     use_load: bool,
+    q_ctrl: InnerQLimits | None = None,
 ) -> None:
     """One Newton-Raphson pass from ``state.V`` under the current classification."""
     state.absorb(
@@ -175,6 +181,7 @@ def _run_nr(
             net=cls.net,
             voltage_dependent_load=use_load,
             step_limits=_step_limits(options),
+            q_ctrl=q_ctrl,
         )
     )
 
@@ -200,6 +207,20 @@ def _nr_with_q_limits(
     """
     q_min = cls.net.bus_q_min
     q_max = cls.net.bus_q_max
+    if can_enforce and options.q_lim_mode == "inner":
+        assert q_min is not None and q_max is not None  # guarded by can_enforce
+        return _nr_inner_q_limits(
+            state,
+            cls,
+            Ybus,
+            ref,
+            options=options,
+            use_load=use_load,
+            pv_original=pv_original,
+            v_set_arr=v_set_arr,
+            q_min=q_min,
+            q_max=q_max,
+        )
     snap = _dc_replace(cls)
     outer_done = False
     q_lim_swaps = 0
@@ -268,6 +289,53 @@ def _nr_with_q_limits(
         _run_nr(state, cls, Ybus, ref, options=options, use_load=use_load)
 
     return q_lim_swaps, snap.net
+
+
+def _nr_inner_q_limits(
+    state: _NRState,
+    cls: _Classification,
+    Ybus: csr_matrix,
+    ref: np.ndarray,
+    *,
+    options: PFOptions,
+    use_load: bool,
+    pv_original: np.ndarray,
+    v_set_arr: np.ndarray,
+    q_min: np.ndarray,
+    q_max: np.ndarray,
+) -> tuple[int, PFInput]:
+    """One Newton pass with Q-limit switching inside it (``q_lim_mode="inner"``).
+
+    Mutates ``state`` and ``cls``; returns ``(q_lim_swaps, pre_swap_net)`` like
+    :func:`_nr_with_q_limits`.
+    """
+    pre_swap_net = cls.net
+    side = np.zeros(cls.net.n_bus, dtype=np.int8)
+    side[cls.locked_lim == q_max] = 1
+    side[(cls.locked_lim == q_min) & (side == 0)] = -1
+    q_ctrl = InnerQLimits(
+        Ybus,
+        pv=cls.pv,
+        pq=cls.pq,
+        Sbus=cls.Sbus,
+        net=cls.net,
+        q_min=q_min,
+        q_max=q_max,
+        v_set=v_set_arr,
+        side=side,
+        pv_original=pv_original,
+        q_lim_tol=options.q_lim_tol,
+        v_deadband_rel=options.q_lim_v_deadband,
+        max_returns=options.q_lim_max_returns,
+        voltage_dependent_load=use_load,
+    )
+    _run_nr(state, cls, Ybus, ref, options=options, use_load=use_load, q_ctrl=q_ctrl)
+    cls.pv = q_ctrl.pv
+    cls.pq = q_ctrl.pq
+    cls.Sbus = q_ctrl.Sbus
+    cls.net = q_ctrl.net
+    cls.locked_lim = q_ctrl.locked_lim
+    return len(q_ctrl.actions), pre_swap_net
 
 
 def _soft_fallback(
@@ -504,6 +572,22 @@ def run_powerflow(
         locked_lim=np.full(net.n_bus, np.nan, dtype=np.float64),
         net=net,
     )
+    if can_enforce and net.bus_q_lock is not None and np.any(net.bus_q_lock):
+        # Generators flagged as already pinned start as PQ at their limit.
+        assert net.bus_q_min is not None and net.bus_q_max is not None
+        cls.pv, cls.pq, cls.Sbus, cls.locked_lim, cls.net = apply_initial_locks(
+            pv,
+            pq,
+            Sbus,
+            net,
+            V0,
+            net.bus_q_min,
+            net.bus_q_max,
+            np.asarray(net.bus_q_lock),
+            voltage_dependent_load=use_load_v,
+        )
+        if use_load_v:
+            cls.Sbus = compute_sbus(cls.net, V0, voltage_dependent=True)
     iters_gs = 0
     q_lim_swaps = 0
 
@@ -511,14 +595,14 @@ def run_powerflow(
     if method in ("gs", "gs+nr"):
         gs_res = gauss_seidel(
             Ybus,
-            Sbus,
+            cls.Sbus,
             V0,
             ref,
-            pv,
-            pq,
+            cls.pv,
+            cls.pq,
             tol=options.tol if method == "gs" else options.gs_tol,
             max_iter=options.max_iter_gs,
-            net=net,
+            net=cls.net,
             voltage_dependent_load=use_load_v,
         )
         state.V = gs_res.V

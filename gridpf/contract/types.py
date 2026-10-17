@@ -32,6 +32,7 @@ SLACK: int = 2
 
 
 Method = Literal["gs+nr", "nr", "gs"]
+QLimMode = Literal["outer", "inner"]
 
 
 @dataclass
@@ -119,6 +120,13 @@ class PFInput:
     # адаптером (типовое значение Растра — 0.7·Vnom → 0.7 p.u.).
     bus_v_critical: np.ndarray | None = None
 
+    # Initial Q-limit state of PV buses (int8): −1 — the generator starts
+    # pinned at Q_min, +1 — at Q_max (the bus starts as PQ with free |V| and
+    # may return to PV under the Q-limit rules), 0 — free. Only honoured with
+    # ``PFOptions.enforce_q_lims=True``. ``None`` (default) — all free,
+    # bit-for-bit with the previous behavior. Since contract 2.1.0.
+    bus_q_lock: np.ndarray | None = None
+
     base_mva: float = BASE_MVA
 
     @property
@@ -183,6 +191,22 @@ class PFOptions:
         step_max_branch_angle: post-step corridor on ``|δ_i − δ_j|`` over
             branches, rad.
 
+        q_lim_mode: where Q limits are checked (with ``enforce_q_lims=True``).
+            ``"outer"`` (default) — outer loop after a fully converged Newton
+            pass, ``q_lim_top_k`` worst violators per pass, PQ→PV only with
+            ``allow_pq_to_pv``. ``"inner"`` — inside the Newton iteration:
+            whenever the residual is within ``tol`` one direction group
+            switches at a fixed priority (PV→Qmax with Qmin→PV first, then
+            PV→Qmin with Qmax→PV), all its candidates at once; pinned buses
+            drifting from ``V_set`` in the wrong direction are also returned
+            to PV after ordinary steps. ``q_lim_top_k`` and ``allow_pq_to_pv``
+            are ignored in this mode; ``q_lim_tol`` is the Q deadband.
+        q_lim_v_deadband: ``"inner"`` mode — relative ``|V|`` deadband of the
+            PQ→PV return at a converged point: a bus pinned at Qmax returns
+            when ``(|V| − V_set)/V_set > deadband`` (symmetrically at Qmin).
+        q_lim_max_returns: ``"inner"`` mode — returns to PV allowed per bus
+            and direction; after that the bus stays pinned.
+
         All ``step_*`` limits default to ``None`` (bit-for-bit with the
         unlimited step); see :mod:`gridpf.solvers.step_limits`.
     """
@@ -205,6 +229,9 @@ class PFOptions:
     step_max_branch_dva: float | None = None
     step_v_corridor: tuple[float, float] | None = None
     step_max_branch_angle: float | None = None
+    q_lim_mode: QLimMode = "outer"
+    q_lim_v_deadband: float = 1e-5
+    q_lim_max_returns: int = 4
 
 
 @dataclass

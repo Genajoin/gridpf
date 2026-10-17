@@ -33,6 +33,7 @@ from gridpf.solvers._common import (
     residual_vector,
     resolve_use_load,
 )
+from gridpf.solvers.q_lims import InnerQLimits
 from gridpf.solvers.step_limits import (
     StepLimits,
     branch_pairs,
@@ -59,6 +60,23 @@ def _sbus_at(
     if net is None or not voltage_dependent_load:
         return sbus_const
     return compute_sbus(net, V, voltage_dependent=True)
+
+
+def _evaluate(
+    Ybus: csr_matrix,
+    Vm: np.ndarray,
+    Va: np.ndarray,
+    pv: np.ndarray,
+    pq: np.ndarray,
+    Sbus_const: np.ndarray,
+    net: PFInput | None,
+    voltage_dependent_load: bool,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Return ``(V, F, ‖F‖∞)`` at the polar point ``(Vm, Va)``."""
+    V = Vm * np.exp(1j * Va)
+    Sbus_v = _sbus_at(V, Sbus_const, net, voltage_dependent_load)
+    f = residual_vector(mismatch(Ybus, V, Sbus_v), pv, pq)
+    return V, f, residual_norm(f)
 
 
 def _try_step(
@@ -105,6 +123,7 @@ def newton_raphson(
     net: PFInput | None = None,
     voltage_dependent_load: bool = False,
     step_limits: StepLimits | None = None,
+    q_ctrl: InnerQLimits | None = None,
 ) -> NRResult:
     """Прогнать Newton-Raphson до сходимости или ``max_iter``.
 
@@ -130,6 +149,13 @@ def newton_raphson(
         step_limits: step-size limits and the post-step corridor (see
             :mod:`gridpf.solvers.step_limits`). ``None`` or all-``None``
             limits — unlimited step, bit-for-bit with the previous behavior.
+        q_ctrl: Q-limit controller of ``q_lim_mode="inner"``. When given, it
+            owns ``pv`` / ``pq`` / ``Sbus`` / ``net`` (the arguments are only
+            the starting point), its :meth:`~InnerQLimits.step_check` runs
+            after every step and its
+            :meth:`~InnerQLimits.convergence_switch` gates convergence: a
+            switch re-evaluates the residual with the new bus types instead
+            of declaring convergence.
 
     Returns:
         ``NRResult`` с финальным напряжением, флагом сходимости, числом
@@ -145,10 +171,20 @@ def newton_raphson(
     Vm = np.abs(V)
     Va = np.angle(V)
 
+    if q_ctrl is not None:
+        pv, pq, Sbus, net = q_ctrl.pv, q_ctrl.pq, q_ctrl.Sbus, q_ctrl.net
+
     Sbus_eff = _sbus_at(V, Sbus, net, use_load)
     mis = mismatch(Ybus, V, Sbus_eff)
     f_vec = residual_vector(mis, pv, pq)
     norm_f = residual_norm(f_vec)
+
+    if q_ctrl is not None and norm_f < tol and max_iter > 0:
+        changed, released = q_ctrl.convergence_switch(V)
+        if changed:
+            pv, pq, Sbus, net = q_ctrl.pv, q_ctrl.pq, q_ctrl.Sbus, q_ctrl.net
+            Vm[released] = q_ctrl.v_set[released]
+            V, f_vec, norm_f = _evaluate(Ybus, Vm, Va, pv, pq, Sbus, net, use_load)
 
     if norm_f < tol or max_iter == 0:
         return NRResult(V=V, converged=norm_f < tol, iterations=0, mismatch_max=norm_f)
@@ -227,9 +263,28 @@ def newton_raphson(
                     Ybus, Vm, Va, dx, mu_try * (1.0 + a), pv, pq, Sbus, net, use_load
                 )
 
+        Vm_prev, Va_prev = Vm, Va
         Vm, Va, V, f_vec, norm_f = Vm_try, Va_try, V_try, f_try, norm_try
 
+        if q_ctrl is not None:
+            released, undo = q_ctrl.step_check(V)
+            if released.size:
+                if undo:
+                    Vm, Va = Vm_prev, Va_prev
+                Vm = Vm.copy()
+                Vm[released] = q_ctrl.v_set[released]
+                pv, pq = q_ctrl.pv, q_ctrl.pq
+                V, f_vec, norm_f = _evaluate(Ybus, Vm, Va, pv, pq, Sbus, net, use_load)
+
         if norm_f < tol:
+            if q_ctrl is not None:
+                changed, released = q_ctrl.convergence_switch(V)
+                if changed:
+                    pv, pq, Sbus, net = q_ctrl.pv, q_ctrl.pq, q_ctrl.Sbus, q_ctrl.net
+                    Vm = Vm.copy()
+                    Vm[released] = q_ctrl.v_set[released]
+                    V, f_vec, norm_f = _evaluate(Ybus, Vm, Va, pv, pq, Sbus, net, use_load)
+                    continue
             converged = True
             break
 

@@ -27,6 +27,7 @@ from gridpf.contract.types import (
     PFInput,
     PFOptions,
     PFResult,
+    QLimMode,
 )
 from gridpf.contract.validate import (
     PFContractValidationError,
@@ -56,6 +57,7 @@ __all__ = [
     "PFInput",
     "PFOptions",
     "PFResult",
+    "QLimMode",
     "ValidationIssue",
     "ValidationReport",
     "current_version",
