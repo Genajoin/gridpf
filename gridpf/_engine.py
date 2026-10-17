@@ -25,9 +25,10 @@ from scipy.sparse.csgraph import connected_components
 from gridpf.algebra.sbus import build_sbus, classify_buses, compute_sbus, q_load_at
 from gridpf.algebra.ybus import build_ybus
 from gridpf.contract.types import BASE_MVA, Method, PFInput, PFOptions, PFResult
-from gridpf.solvers._common import resolve_use_load
+from gridpf.solvers._common import mismatch, residual_norm, residual_vector, resolve_use_load
 from gridpf.solvers.dc_pf import dc_powerflow
 from gridpf.solvers.gauss_seidel import gauss_seidel
+from gridpf.solvers.gauss_seidel_ordered import gauss_seidel_ordered
 from gridpf.solvers.newton_raphson import NRResult, newton_raphson
 from gridpf.solvers.q_lims import (
     InnerQLimits,
@@ -153,6 +154,33 @@ def _nr_tols(options: PFOptions) -> tuple[float, float | None]:
     tol_p = options.tol_p if options.tol_p is not None else options.tol
     tol_q = options.tol_q if options.tol_q is not None else options.tol
     return tol_p, tol_q
+
+
+def _residual_norm_at(
+    Ybus: csr_matrix, V: np.ndarray, Sbus: np.ndarray, pv: np.ndarray, pq: np.ndarray
+) -> float:
+    """Infinity norm of the PF residual at ``V``."""
+    return residual_norm(residual_vector(mismatch(Ybus, V, Sbus), pv, pq))
+
+
+def _gs_made_worse(
+    gs_res: NRResult,
+    V0: np.ndarray,
+    Ybus: csr_matrix,
+    cls: _Classification,
+    options: PFOptions,
+    use_load: bool,
+) -> bool:
+    """Whether the Gauss-Seidel warm start should be discarded (``gs_guard``)."""
+    if not np.all(np.isfinite(gs_res.V)) or not np.isfinite(gs_res.mismatch_max):
+        return True
+    if options.step_v_corridor is not None:
+        v_lo, v_hi = options.step_v_corridor
+        vm = np.abs(gs_res.V)
+        if np.any((vm < v_lo) | (vm > v_hi)):
+            return True
+    sbus0 = compute_sbus(cls.net, V0, voltage_dependent=True) if use_load else cls.Sbus
+    return gs_res.mismatch_max > _residual_norm_at(Ybus, V0, sbus0, cls.pv, cls.pq)
 
 
 def _step_limits(options: PFOptions) -> StepLimits:
@@ -558,6 +586,12 @@ def run_powerflow(
     # всегда побеждает тёплый старт на управляемых узлах.
     V0 = init_v if init_v is not None else _flat_start(net)
     V0 = _apply_setpoints(net, V0)
+    if init_v is not None and options.init_v_max_mismatch is not None:
+        use_load_init = resolve_use_load(net, options.use_load_voltage_dependency)
+        sbus_init = compute_sbus(net, V0, voltage_dependent=True) if use_load_init else Sbus
+        if not _residual_norm_at(Ybus, V0, sbus_init, pv, pq) <= options.init_v_max_mismatch:
+            # The warm start is too far off: start flat instead.
+            V0 = _apply_setpoints(net, _flat_start(net))
 
     # Начальные параметры enforce_q_lims (если выключено — массивы не используются).
     pv_original = pv.copy()
@@ -605,23 +639,41 @@ def run_powerflow(
 
     # GS warm-start выполняется один раз — переключения PV/PQ затрагивают только NR-фазу.
     if method in ("gs", "gs+nr"):
-        gs_res = gauss_seidel(
-            Ybus,
-            cls.Sbus,
-            V0,
-            ref,
-            cls.pv,
-            cls.pq,
-            tol=options.tol if method == "gs" else options.gs_tol,
-            max_iter=options.max_iter_gs,
-            net=cls.net,
-            voltage_dependent_load=use_load_v,
-        )
+        gs_tol = options.tol if method == "gs" else options.gs_tol
+        if options.gs_mode == "ordered":
+            gs_res = gauss_seidel_ordered(
+                Ybus,
+                cls.Sbus,
+                V0,
+                ref,
+                cls.pv,
+                cls.pq,
+                net=cls.net,
+                passes=options.max_iter_gs,
+                tol=gs_tol,
+                voltage_dependent_load=use_load_v,
+            )
+        else:
+            gs_res = gauss_seidel(
+                Ybus,
+                cls.Sbus,
+                V0,
+                ref,
+                cls.pv,
+                cls.pq,
+                tol=gs_tol,
+                max_iter=options.max_iter_gs,
+                net=cls.net,
+                voltage_dependent_load=use_load_v,
+            )
         state.V = gs_res.V
         iters_gs = gs_res.iterations
         state.mismatch = gs_res.mismatch_max
         if method == "gs":
             state.converged = gs_res.converged
+        elif options.gs_guard and _gs_made_worse(gs_res, V0, Ybus, cls, options, use_load_v):
+            # Guard: the warm start did harm — Newton starts from the pre-GS voltage.
+            state.V = V0
 
     # Внешний цикл по Q-лимитам. Без enforce_q_lims — ровно одна итерация NR.
     if method in ("nr", "gs+nr"):

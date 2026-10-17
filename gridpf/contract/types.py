@@ -33,6 +33,7 @@ SLACK: int = 2
 
 Method = Literal["gs+nr", "nr", "gs"]
 QLimMode = Literal["outer", "inner"]
+GSMode = Literal["classic", "ordered"]
 
 
 @dataclass
@@ -248,6 +249,19 @@ class PFOptions:
         q_lim_max_returns: ``"inner"`` mode — returns to PV allowed per bus
             and direction; after that the bus stays pinned.
 
+        gs_mode: Gauss-Seidel warm start. ``"classic"`` (default) — buses in
+            index order, constant-power load, up to ``max_iter_gs`` iterations
+            down to ``gs_tol``. ``"ordered"`` — exactly ``max_iter_gs`` passes
+            in the order of the referred series impedance from the slack,
+            loads with ``P > 0, Q > 0`` taken as admittances at the current
+            ``|V|`` (see :mod:`gridpf.solvers.gauss_seidel_ordered`).
+        gs_guard: discard the Gauss-Seidel result and start Newton from the
+            pre-GS voltage when GS made the residual worse, produced a
+            non-finite value or left ``step_v_corridor``. ``False`` — off.
+        init_v_max_mismatch: with a warm start ``init_v``, fall back to the
+            flat start when the residual at ``init_v`` exceeds this value
+            (p.u.). ``None`` — off.
+
         All ``step_*`` limits default to ``None`` (bit-for-bit with the
         unlimited step); see :mod:`gridpf.solvers.step_limits`.
     """
@@ -275,6 +289,9 @@ class PFOptions:
     q_lim_mode: QLimMode = "outer"
     q_lim_v_deadband: float = 1e-5
     q_lim_max_returns: int = 4
+    gs_mode: GSMode = "classic"
+    gs_guard: bool = False
+    init_v_max_mismatch: float | None = None
 
 
 @dataclass

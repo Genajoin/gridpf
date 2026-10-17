@@ -85,6 +85,11 @@ class StepLimits:
         return self.max_branch_dva is not None or self.max_branch_angle is not None
 
 
+def _wrap(angle: np.ndarray) -> np.ndarray:
+    """Wrap angles to ``(−π, π]``."""
+    return np.asarray(np.angle(np.exp(1j * angle)))
+
+
 def branch_pairs(Ybus: csr_matrix) -> tuple[np.ndarray, np.ndarray]:
     """Return ``(i, j)`` bus pairs (``i < j``) coupled by at least one branch."""
     coo = Ybus.tocoo()
@@ -162,8 +167,10 @@ def corridor_correction(
             a = min(a, float(np.min((v_lo - Vm_new[down]) / d[down])))
     if limits.max_branch_angle is not None and pairs is not None and pairs[0].size:
         i, j = pairs
-        th_new = np.abs(Va_new[i] - Va_new[j])
-        th_old = np.abs(Va_old[i] - Va_old[j])
+        # Angle differences wrapped to (−π, π]: the starting angles come from
+        # np.angle and may sit on opposite sides of ±π.
+        th_new = np.abs(_wrap(Va_new[i] - Va_new[j]))
+        th_old = np.abs(_wrap(Va_old[i] - Va_old[j]))
         dth = np.abs((Va_new[i] - Va_new[j]) - (Va_old[i] - Va_old[j]))
         out = (th_old < limits.max_branch_angle) & (th_new > limits.max_branch_angle)
         if out.any():
