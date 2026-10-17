@@ -185,6 +185,12 @@ class PFOptions:
             ``"nr"`` — только Newton-Raphson из flat-старта; ``"gs"`` — только
             Gauss-Seidel.
         tol: целевая ∞-норма мощностного небаланса (p.u.).
+        tol_p, tol_q: separate Newton tolerances (p.u.) on the active and the
+            reactive residual: converged when ``max|ΔP| < tol_p`` and
+            ``max|ΔQ| < tol_q``. ``None`` falls back to ``tol``; both ``None``
+            (default) — a single ``tol`` on the whole residual, bit-for-bit.
+            They also gate the Q-limit check of ``q_lim_mode="inner"``. The
+            Gauss-Seidel phase keeps ``tol`` / ``gs_tol``.
         max_iter_gs: максимум итераций Gauss-Seidel (в ``"gs+nr"`` — короткий
             warm-start).
         max_iter_nr: максимум итераций Newton-Raphson.
@@ -248,6 +254,8 @@ class PFOptions:
 
     method: Method = "gs+nr"
     tol: float = 1e-8
+    tol_p: float | None = None
+    tol_q: float | None = None
     max_iter_gs: int = 10
     max_iter_nr: int = 30
     gs_tol: float = 1e-2

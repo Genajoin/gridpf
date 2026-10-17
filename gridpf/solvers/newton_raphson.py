@@ -118,6 +118,7 @@ def newton_raphson(
     pq: np.ndarray,
     *,
     tol: float = 1e-8,
+    tol_q: float | None = None,
     max_iter: int = 30,
     step_control: bool = True,
     net: PFInput | None = None,
@@ -138,6 +139,9 @@ def newton_raphson(
         pv: индексы PV-шин.
         pq: индексы PQ-шин.
         tol: целевая ∞-норма небаланса.
+        tol_q: separate tolerance on the reactive residual; ``tol`` then
+            applies to the active one only. ``None`` — a single ``tol`` on the
+            whole residual (bit-for-bit with the previous behavior).
         max_iter: максимальное число итераций.
         step_control: если ``True`` — backtracking line search по μ при росте
             нормы небаланса (μ ← μ/2, до 5 раз). Расширяет область сходимости
@@ -179,15 +183,21 @@ def newton_raphson(
     f_vec = residual_vector(mis, pv, pq)
     norm_f = residual_norm(f_vec)
 
-    if q_ctrl is not None and norm_f < tol and max_iter > 0:
+    def within_tol(f: np.ndarray, norm: float) -> bool:
+        if tol_q is None:
+            return norm < tol
+        n_p = pv.size + pq.size
+        return residual_norm(f[:n_p]) < tol and residual_norm(f[n_p:]) < tol_q
+
+    if q_ctrl is not None and within_tol(f_vec, norm_f) and max_iter > 0:
         changed, released = q_ctrl.convergence_switch(V)
         if changed:
             pv, pq, Sbus, net = q_ctrl.pv, q_ctrl.pq, q_ctrl.Sbus, q_ctrl.net
             Vm[released] = q_ctrl.v_set[released]
             V, f_vec, norm_f = _evaluate(Ybus, Vm, Va, pv, pq, Sbus, net, use_load)
 
-    if norm_f < tol or max_iter == 0:
-        return NRResult(V=V, converged=norm_f < tol, iterations=0, mismatch_max=norm_f)
+    if within_tol(f_vec, norm_f) or max_iter == 0:
+        return NRResult(V=V, converged=within_tol(f_vec, norm_f), iterations=0, mismatch_max=norm_f)
 
     scaling = step_limits is not None and step_limits.scaling_active
     corridor = step_limits is not None and step_limits.corridor_active
@@ -276,7 +286,7 @@ def newton_raphson(
                 pv, pq = q_ctrl.pv, q_ctrl.pq
                 V, f_vec, norm_f = _evaluate(Ybus, Vm, Va, pv, pq, Sbus, net, use_load)
 
-        if norm_f < tol:
+        if within_tol(f_vec, norm_f):
             if q_ctrl is not None:
                 changed, released = q_ctrl.convergence_switch(V)
                 if changed:

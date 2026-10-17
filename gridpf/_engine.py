@@ -146,6 +146,15 @@ class _Classification:
         self.net = snap.net
 
 
+def _nr_tols(options: PFOptions) -> tuple[float, float | None]:
+    """Newton ``(tol, tol_q)``: one ``tol`` unless ``tol_p`` or ``tol_q`` is set."""
+    if options.tol_p is None and options.tol_q is None:
+        return options.tol, None
+    tol_p = options.tol_p if options.tol_p is not None else options.tol
+    tol_q = options.tol_q if options.tol_q is not None else options.tol
+    return tol_p, tol_q
+
+
 def _step_limits(options: PFOptions) -> StepLimits:
     """Newton step limits taken from the engine options."""
     return StepLimits(
@@ -176,7 +185,8 @@ def _run_nr(
             ref,
             cls.pv,
             cls.pq,
-            tol=options.tol,
+            tol=_nr_tols(options)[0],
+            tol_q=_nr_tols(options)[1],
             max_iter=options.max_iter_nr,
             net=cls.net,
             voltage_dependent_load=use_load,
@@ -390,7 +400,8 @@ def _soft_fallback(
         ref_orig,
         pv_orig_arr,
         pq_orig_arr,
-        tol=options.tol,
+        tol=_nr_tols(options)[0],
+        tol_q=_nr_tols(options)[1],
         max_iter=options.max_iter_nr,
         net=net_orig,
         voltage_dependent_load=use_load,
@@ -433,7 +444,8 @@ def _dc_fallback(
         ref_d,
         pv_d,
         pq_d,
-        tol=options.tol,
+        tol=_nr_tols(options)[0],
+        tol_q=_nr_tols(options)[1],
         max_iter=options.max_iter_nr,
         net=cls.net,
         voltage_dependent_load=use_load,

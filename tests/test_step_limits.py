@@ -186,3 +186,30 @@ class TestEngine:
         assert ref.converged and lim.converged
         assert lim.iterations_nr > ref.iterations_nr
         np.testing.assert_allclose(lim.V, ref.V, atol=1e-8)
+
+
+class TestTolerances:
+    def test_default_single_tol_bit_for_bit(self, build_net: Callable[..., PFInput]) -> None:
+        net = _chain(build_net)
+        a = solve(net, PFOptions())
+        b = solve(net, PFOptions(tol_p=None, tol_q=None))
+        np.testing.assert_array_equal(a.V, b.V)
+
+    def test_separate_q_tolerance(self, build_net: Callable[..., PFInput]) -> None:
+        # At the solution, perturb only the reactive injection of a PQ bus:
+        # the active residual stays ~0, the reactive one becomes 1e-3.
+        net = _chain(build_net)
+        ybus, _, _ = build_ybus(net)
+        sbus = build_sbus(net)
+        ref, pv, pq = classify_buses(net.bus_type)
+        V = solve(net, PFOptions(method="nr", tol=1e-12)).V
+        sbus_q = sbus.copy()
+        sbus_q[pq[0]] += 1e-3j
+
+        def converged(**kw: float | None) -> bool:
+            res = newton_raphson(ybus, sbus_q, V, ref, pv, pq, max_iter=0, **kw)  # type: ignore[arg-type]
+            return res.converged
+
+        assert not converged(tol=1e-8)
+        assert converged(tol=1e-8, tol_q=1e-2)
+        assert not converged(tol=1e-8, tol_q=1e-4)
