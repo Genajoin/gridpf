@@ -225,6 +225,12 @@ def _gs_made_worse(
     return gs_res.mismatch_max > _residual_norm_at(Ybus, V0, sbus0, cls.pv, cls.pq)
 
 
+def _q_residual_tol(options: PFOptions) -> float:
+    """Tolerance the Newton pass guarantees on the reactive residual."""
+    tol_p, tol_q = _nr_tols(options)
+    return tol_q if tol_q is not None else tol_p
+
+
 def _step_limits(options: PFOptions) -> StepLimits:
     """Newton step limits taken from the engine options."""
     return StepLimits(
@@ -526,7 +532,14 @@ def _soft_fallback(
 def _dc_start(net: PFInput) -> np.ndarray:
     """Flat moduli with setpoints, angles from the DC power flow."""
     ref_d, pv_d, pq_d = classify_buses(net.bus_type)
-    delta_dc = dc_powerflow(net, P_inj=build_sbus(net).real, ref=ref_d, pv=pv_d, pq=pq_d)
+    # Slack angles from bus_va_set (NaN → 0): with several slack buses the DC
+    # angles must be anchored at their set angles, which Newton keeps fixed.
+    delta_ref = None
+    if net.bus_va_set is not None:
+        delta_ref = np.nan_to_num(np.asarray(net.bus_va_set, dtype=np.float64)[ref_d], nan=0.0)
+    delta_dc = dc_powerflow(
+        net, P_inj=build_sbus(net).real, ref=ref_d, pv=pv_d, pq=pq_d, delta_ref=delta_ref
+    )
     # Стартовое V для NR: модули как в flat+setpoints, углы из DC.
     V_dc = _apply_setpoints(net, _flat_start(net))
     result: np.ndarray = np.abs(V_dc) * np.exp(1j * delta_dc)
@@ -586,6 +599,7 @@ def _count_q_violations(
     pv_original: np.ndarray,
     *,
     q_lim_tol: float,
+    q_residual_tol: float,
     use_load: bool,
 ) -> int:
     """Count originally-PV buses violating generator Q-limits at the solution.
@@ -593,15 +607,19 @@ def _count_q_violations(
     Generator semantics, shared with :func:`enforce_q_limits`: the limit is
     compared against ``Q_gen = Q_inj + Q_load(|V|)``, not the net injection —
     otherwise a loaded generator bus reports a false violation. The deadband
-    is widened by :data:`_Q_VIOLATION_EPS` so reporting stays consistent with
-    what enforcement pinned at the limit.
+    is widened by :data:`_Q_VIOLATION_EPS` — or by the Newton reactive
+    tolerance ``q_residual_tol`` when it is larger: a bus pinned at its limit
+    holds ``Q_gen = Q_lim`` only up to the reactive residual — so reporting
+    stays consistent with what enforcement pinned at the limit.
     """
     q_min, q_max = net.bus_q_min, net.bus_q_max
     assert q_min is not None and q_max is not None  # guarded by can_enforce
     S_calc = V * np.conj(Ybus @ V)
     q_gen = S_calc.imag + q_load_at(net, V, voltage_dependent=use_load)
     return len(
-        q_limit_violations(q_gen, q_min, q_max, pv_original, tol=q_lim_tol + _Q_VIOLATION_EPS)
+        q_limit_violations(
+            q_gen, q_min, q_max, pv_original, tol=q_lim_tol + max(_Q_VIOLATION_EPS, q_residual_tol)
+        )
     )
 
 
@@ -804,6 +822,7 @@ def run_powerflow(
             Ybus,
             pv_original,
             q_lim_tol=options.q_lim_tol,
+            q_residual_tol=_q_residual_tol(options),
             use_load=use_load_v,
         )
 
